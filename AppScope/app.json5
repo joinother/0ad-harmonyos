@@ -1,0 +1,11 @@
+{
+  "app": {
+    "bundleName": "com.joinother.zeroad",
+    "vendor": "joinother",
+    "versionCode": 1000006,
+    "versionName": "0.28.0",
+    "buildVersion": "1",
+    "icon": "$media:app_icon",
+    "label": "$string:app_name"
+  }
+}

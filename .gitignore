@@ -1,0 +1,18 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+**/build-ohos
+/.hvigor
+.cxx
+/.clang-format
+**/.test
+/.appanalyzer
+
+# Pre-built shared libraries (build artifacts)
+*.so
+*.so.*
+
+# SDL3 source (symlink to external SDL-src; create your own — see README)
+/entry/src/main/cpp/SDL

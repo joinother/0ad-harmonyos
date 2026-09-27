@@ -1,0 +1,32 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "0 A.D. - open-source RTS"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "0 A.D. - ancient warfare"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "0 A.D."
+    },
+    {
+      "name": "perm_reason_MICROPHONE",
+      "value": "Used to record audio"
+    },
+    {
+      "name": "perm_reason_CAMERA",
+      "value": "Used to record video"
+    },
+    {
+      "name": "perm_reason_INTERNET",
+      "value": "Used to download additional content"
+    },
+    {
+      "name": "perm_reason_READ_PASTEBOARD",
+      "value": "Used to read from the pasteboard"
+    }
+  ]
+}
