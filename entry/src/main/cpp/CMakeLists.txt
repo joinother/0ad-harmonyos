@@ -3,11 +3,25 @@ project(zeroad CXX C)
 
 # ROOT points to a directory containing the 0 A.D. source tree and
 # cross-compiled dependencies (lycium). Set ZEROAD_ROOT env var to override.
+# Otherwise walk up from this file until we find a directory that contains both
+# marker paths (robust against exact nesting depth / hvigor loader copies).
+set(ROOT "")
 if(DEFINED ENV{ZEROAD_ROOT})
-    set(ROOT $ENV{ZEROAD_ROOT})
+    set(ROOT "$ENV{ZEROAD_ROOT}")
 else()
-    set(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../..")
+    set(_dir "${CMAKE_CURRENT_SOURCE_DIR}")
+    foreach(_i RANGE 1 10)
+        get_filename_component(_dir "${_dir}" DIRECTORY)
+        if(EXISTS "${_dir}/lycium/lycium/usr" AND EXISTS "${_dir}/0ad-0.28.0/source")
+            set(ROOT "${_dir}")
+            break()
+        endif()
+    endforeach()
 endif()
+if(NOT ROOT)
+    message(FATAL_ERROR "Could not locate the 0 A.D. ROOT (expected sibling directories '0ad-0.28.0' and 'lycium'). Set the ZEROAD_ROOT environment variable.")
+endif()
+message(STATUS "0 A.D. ROOT = ${ROOT}")
 set(AD "${ROOT}/0ad-0.28.0")
 set(SRC "${AD}/source")
 set(USR "${ROOT}/lycium/lycium/usr")
@@ -112,23 +126,27 @@ target_compile_options(pyrogenesis PRIVATE
 
 # ---------------- libCollada.so (DAE -> PMD/PSA converter) ----------------
 file(GLOB COLLADA_SRCS "${SRC}/collada/*.cpp")
-add_library(Collada SHARED ${COLLADA_SRCS})
-target_include_directories(Collada PRIVATE ${SRC}/collada ${ENGINE_INCLUDES})
-target_compile_definitions(Collada PRIVATE
-	NDEBUG LINUX CONFIG_FINAL=1 CONFIG_ENABLE_PCH=0 _GNU_SOURCE
-)
-target_compile_options(Collada PRIVATE
-	-fvisibility=hidden -fno-strict-aliasing
-	-Wno-all -Wno-extra -Wno-deprecated-copy-with-user-provided-copy
-)
-target_link_libraries(Collada PRIVATE
-	${USR}/fcollada/arm64-v8a/lib/libFColladaSR.a
-	${USR}/libxml2/arm64-v8a/lib/libxml2.so
-	${USR}/libiconv/arm64-v8a/lib/libiconv.so
-	${USR}/zlib/arm64-v8a/lib/libz.a
-	dl m
-)
-set_target_properties(Collada PROPERTIES OUTPUT_NAME Collada PREFIX lib)
+if(COLLADA_SRCS)
+	add_library(Collada SHARED ${COLLADA_SRCS})
+	target_include_directories(Collada PRIVATE ${SRC}/collada ${ENGINE_INCLUDES})
+	target_compile_definitions(Collada PRIVATE
+		NDEBUG LINUX CONFIG_FINAL=1 CONFIG_ENABLE_PCH=0 _GNU_SOURCE
+	)
+	target_compile_options(Collada PRIVATE
+		-fvisibility=hidden -fno-strict-aliasing
+		-Wno-all -Wno-extra -Wno-deprecated-copy-with-user-provided-copy
+	)
+	target_link_libraries(Collada PRIVATE
+		${USR}/fcollada/arm64-v8a/lib/libFColladaSR.a
+		${USR}/libxml2/arm64-v8a/lib/libxml2.so
+		${USR}/libiconv/arm64-v8a/lib/libiconv.so
+		${USR}/zlib/arm64-v8a/lib/libz.a
+		dl m
+	)
+	set_target_properties(Collada PROPERTIES OUTPUT_NAME Collada PREFIX lib)
+else()
+	message(STATUS "Collada: no sources matched; skipping libCollada.so (not needed at runtime; art ships pre-converted and Atlas/DAE authoring is excluded).")
+endif()
 
 # ---------------- libmain.so ----------------
 add_library(main SHARED ohos_wrapper.c ohos_bootstrap.cpp ohos_cli.cpp cacert_data.c ohos_input_monitor.cpp)
