@@ -9,6 +9,9 @@
 | 公开镜像 | https://repo.or.cz/0ad.mirror.git |
 | ⚠️ 已停更镜像 | https://github.com/0ad/0ad —— 最新 tag 仅到 `A26`（2022），最后提交 2024-08-17，**不能用于同步** |
 | 版本 | 0 A.D. **0.28「Boiorix」** |
+| 上游 tag | `v0.28.0` |
+| 上游基线提交 | `a2cae4d69f81`（2026-02-15，"Update appdata for next RC"） |
+| 上游 master 现状 | 最新提交 **2026-10-21**（`46a5570281` "Fix spidermonkey build rust target detection"）——**基线之后上游仍在活跃开发约 8 个月** |
 | 基线产物 | `0ad-0.28.0-unix-build.tar.xz`（官方发布包，**当前最可靠锚点**） |
 | 基线 sha256 | `27e217755ef76a922fe58dbf593d96e54b6ed2375d23f548c35619aa6bd5a42a` |
 | 补丁集 | `patches/0001-ohos-engine-0ad-0.28.0.patch` |
@@ -23,15 +26,23 @@
 
 因此：
 
+- **基线落后上游约 8 个月**：快照取自 `v0.28.0`（2026-02-15），而上游 master
+  已经推进到 2026-10-21
 - 上游 0.28 之后的 bug 修复、安全修复、平台改动**不会自动进入本移植**
 - 升级到新的上游版本时，需要把 61 个补丁**重新 rebase** 到新源码上；
   冲突预计集中在 `source/ps`（20 个文件，启动流程/GameSetup/HWDetect）
-- 判断"快照有没有偏离上游"唯一可靠的依据是基线包的 sha256，
-  因为 GitHub 镜像已停更、无法用 tag 比对
+- 判断"快照有没有偏离上游"最快的依据是 `v0.28.0` tag（`a2cae4d69f81`）；
+  连不上 Gitea 时退回用基线包的 sha256 校验
+
+> 核对方式：GitHub 的 `0ad/0ad` 已停更（最新 tag `A26`/2022，最后提交 2024-08），
+> 不能用。Gitea 在本机需经 Clash 代理访问（`gitea.wildfiregames.com` 会解析到
+> Clash 的 fake-IP 段 `198.18.x.x`，直连会被判定为非公网地址）。
+> 本次核对经 `http://127.0.0.1:7897` 代理访问 Gitea REST API 完成；
+> 其 `compare` 接口返回 404，故未能取得精确提交增量。
 
 若将来要接入上游，建议：在 `<workspace>/0ad-0.28.0` 初始化 git 并
 `git remote add upstream https://gitea.wildfiregames.com/0ad/0ad`，
-把基线包的 commit 记为某个 tag，再定期 `git merge upstream/master`。
+检出 `v0.28.0` 作为基线提交，再定期 `git merge upstream/master`。
 
 ## 应用补丁
 
