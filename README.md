@@ -118,11 +118,17 @@ the baseline tarball:
 |---|---|
 | `patches/verify.sh` | Checks that the current engine tree still equals *pristine + patch*. Run it after any engine edit; exits non-zero and lists the drifting files. |
 | `patches/regen.sh` | Regenerates the patch from pristine + current sources, prints the new file count / line delta and the baseline sha256 (update `UPSTREAM.md` afterwards). |
+| `scripts/sync-upstream.sh` | Fetches the upstream tag's tree from Gitea (blobless, ~1 MB) and hash-compares it against the local engine, so a drift outside the patch is detected. |
 
 ```bash
-./patches/verify.sh    # ✅ no drift  /  ⚠️ lists drifting files
-./patches/regen.sh     # rewrite the patch after intentional engine changes
+./patches/verify.sh         # ✅ no drift  /  ⚠️ lists drifting files
+./patches/regen.sh          # rewrite the patch after intentional engine changes
+./scripts/sync-upstream.sh  # compare against the actual upstream tag (needs proxy)
 ```
+
+> Upstream access notes: `gitea.wildfiregames.com` resolves to a Clash fake-IP
+> (`198.18.x.x`) on this machine and its smart-http breaks under protocol v2 —
+> the helper forces `protocol.version=0` and reuses `git config http.proxy`.
 
 ## Dependency Build Scripts
 

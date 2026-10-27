@@ -44,6 +44,37 @@
 `git remote add upstream https://gitea.wildfiregames.com/0ad/0ad`，
 检出 `v0.28.0` 作为基线提交，再定期 `git merge upstream/master`。
 
+## 基线核对（2026-10-28）
+
+用 `scripts/sync-upstream.sh` 拉取上游 `v0.28.0` 的目录树，与本地引擎做 **blob 哈希比对**
+（`--filter=blob:none` 只取目录树，不下载任何文件内容）：
+
+| 分类 | 文件数 | 说明 |
+|---|---|---|
+| 内容完全一致 | 1605 | — |
+| **补丁覆盖的差异** | **61** | 与 `patches/0001-ohos-engine-0ad-0.28.0.patch` 的文件数完全吻合 |
+| 补丁之外的差异 | 9 | 全是 `source/tools/templatesanalyzer/…/themes/*.png`，官方 tarball 与 git tag 的素材差异，与移植无关 |
+| 仅上游有 | 8 | Windows 专用 `.exe/.bat/.dll`，Unix 发布包不含 |
+| 仅本地有 | 1 | `source/tools/spirv/rules.json` |
+
+**结论：本地引擎 == 上游 `v0.28.0` + 本仓库补丁。** 锚点是可靠的。
+
+## 网络与协议要点
+
+- `gitea.wildfiregames.com` 在本机解析到 Clash 的 fake-IP 段（`198.18.x.x`），
+  直连会被判定为非公网地址，需要走代理
+- 该 Gitea 的 smart-http 在 **protocol v2 下会中途断开**（`RPC failed / curl 18`），
+  必须显式 `-c protocol.version=0`
+- 全库约 **15 GB**；即使 `--depth 1` 也要拉数 GB 素材。
+  做法是用 `--filter=blob:none --no-checkout` 只取提交与目录树（约 1 MB），
+  再与本地文件做哈希比对 —— 全程不需要下载文件内容
+
+```bash
+./scripts/sync-upstream.sh           # 校验本地引擎 == 上游 tag + 补丁
+./scripts/sync-upstream.sh --fetch   # 重新拉取上游目录树
+REF=a27.1 ./scripts/sync-upstream.sh # 核对其他上游版本
+```
+
 ## 应用补丁
 
 ```bash
