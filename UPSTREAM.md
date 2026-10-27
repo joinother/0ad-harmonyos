@@ -5,14 +5,33 @@
 
 | 项目 | 值 |
 |---|---|
-| 上游仓库 | https://github.com/0ad/0ad |
+| 上游官方仓库 | https://gitea.wildfiregames.com/0ad/0ad （0 A.D. 官方开发已迁至 Gitea） |
+| 公开镜像 | https://repo.or.cz/0ad.mirror.git |
+| ⚠️ 已停更镜像 | https://github.com/0ad/0ad —— 最新 tag 仅到 `A26`（2022），最后提交 2024-08-17，**不能用于同步** |
 | 版本 | 0 A.D. **0.28「Boiorix」** |
-| 基线产物 | `0ad-0.28.0-unix-build.tar.xz`（官方发布包） |
+| 基线产物 | `0ad-0.28.0-unix-build.tar.xz`（官方发布包，**当前最可靠锚点**） |
 | 基线 sha256 | `27e217755ef76a922fe58dbf593d96e54b6ed2375d23f548c35619aa6bd5a42a` |
 | 补丁集 | `patches/0001-ohos-engine-0ad-0.28.0.patch` |
 | 涉及文件 | **61 个**，全部位于 `source/` 下 |
 | 改动规模 | +1460 / −532 行 |
 | 记录时间 | 2026-10-28 |
+
+## 同步状态
+
+**当前不与上游同步。** 引擎是一份 0.28 的冻结快照，加上本文档记录的补丁；
+仓库没有 `upstream` remote，也没有 merge/rebase 机制。
+
+因此：
+
+- 上游 0.28 之后的 bug 修复、安全修复、平台改动**不会自动进入本移植**
+- 升级到新的上游版本时，需要把 61 个补丁**重新 rebase** 到新源码上；
+  冲突预计集中在 `source/ps`（20 个文件，启动流程/GameSetup/HWDetect）
+- 判断"快照有没有偏离上游"唯一可靠的依据是基线包的 sha256，
+  因为 GitHub 镜像已停更、无法用 tag 比对
+
+若将来要接入上游，建议：在 `<workspace>/0ad-0.28.0` 初始化 git 并
+`git remote add upstream https://gitea.wildfiregames.com/0ad/0ad`，
+把基线包的 commit 记为某个 tag，再定期 `git merge upstream/master`。
 
 ## 应用补丁
 
