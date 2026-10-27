@@ -1,0 +1,4239 @@
+diff -ruN --text a/source/graphics/CameraController.cpp b/source/graphics/CameraController.cpp
+--- a/source/graphics/CameraController.cpp	2025-12-22 11:24:43
++++ b/source/graphics/CameraController.cpp	2026-09-27 10:50:35
+@@ -49,6 +49,13 @@
+ 
+ extern int g_xres, g_yres;
+ 
++// Provided by SDL's OpenHarmony core; the engine consumes the custom event.
++extern "C" unsigned int SDL_OpenHarmonyGetTouchpadGestureEventType(void);
++#ifndef SDL_OPENHARMONY_TOUCHPAD_GESTURE_PAN
++#define SDL_OPENHARMONY_TOUCHPAD_GESTURE_PAN   1
++#define SDL_OPENHARMONY_TOUCHPAD_GESTURE_PINCH 2
++#endif
++
+ // Maximum distance outside the edge of the map that the camera's
+ // focus point can be moved
+ static const float CAMERA_EDGE_MARGIN = 2.0f * TERRAIN_TILE_SIZE;
+@@ -59,6 +66,7 @@
+ 	  m_FollowEntity(INVALID_ENTITY),
+ 	  m_FollowFirstPerson(false),
+ 	  m_BirdsEyeView(false),
++	  m_TouchpadGestureEventType(0),
+ 
+ 	  // Dummy values (these will be filled in by the config file)
+ 	  m_ViewScrollSpeed(0),
+@@ -122,6 +130,7 @@
+ 	m_ViewScrollSpeedModifier = g_ConfigDB.Get("view.scroll.speed.modifier", m_ViewScrollSpeedModifier);
+ 	m_ViewScrollMouseDetectDistance = g_ConfigDB.Get("view.scroll.mouse.detectdistance",
+ 		m_ViewScrollMouseDetectDistance);
++	m_TouchpadGestureEventType = SDL_OpenHarmonyGetTouchpadGestureEventType();
+ 	m_ViewRotateXSpeed = g_ConfigDB.Get("view.rotate.x.speed", m_ViewRotateXSpeed);
+ 	m_ViewRotateXMin = g_ConfigDB.Get("view.rotate.x.min", m_ViewRotateXMin);
+ 	m_ViewRotateXMax = g_ConfigDB.Get("view.rotate.x.max", m_ViewRotateXMax);
+@@ -654,8 +663,48 @@
+ 		m_PosY.Add(diff);
+ }
+ 
++void CCameraController::TouchpadPan(float dxPx, float dyPx)
++{
++	// Natural "grab the map" mapping (matches touch screens and natural-scrolling
++	// trackpads): pull the map right (dx>0) to reveal the left side (camera moves
++	// left); pull the map down (dy>0) to reveal what is above (camera moves forward).
++	// m_ViewDragSpeed is world-distance per pixel.
++	const float moveRightward = -dxPx * m_ViewDragSpeed;
++	const float moveForward = dyPx * m_ViewDragSpeed;
++
++	m_FollowEntity = INVALID_ENTITY;
++
++	const float s = sin(m_RotateY.GetSmoothedValue());
++	const float c = cos(m_RotateY.GetSmoothedValue());
++	m_PosX.AddSmoothly(c * moveRightward + s * moveForward);
++	m_PosZ.AddSmoothly(-s * moveRightward + c * moveForward);
++}
++
+ InReaction CCameraController::HandleEvent(const SDL_Event_* ev)
+ {
++	if (m_TouchpadGestureEventType != 0 && ev->ev.type == m_TouchpadGestureEventType)
++	{
++		auto ptrAsFloat = [](void* p) -> float {
++			union { intptr_t u; int32_t i; } a;
++			a.u = (intptr_t) p;
++			union { int32_t i; float f; } b;
++			b.i = a.i;
++			return b.f;
++		};
++		const int code = ev->ev.user.code;
++		if (code == SDL_OPENHARMONY_TOUCHPAD_GESTURE_PAN)
++		{
++			TouchpadPan(ptrAsFloat(ev->ev.user.data1), ptrAsFloat(ev->ev.user.data2));
++		}
++		else if (code == SDL_OPENHARMONY_TOUCHPAD_GESTURE_PINCH)
++		{
++			// Outward (delta > 0) zooms in, which decreases m_Zoom.
++			const float d = ptrAsFloat(ev->ev.user.data1);
++			m_Zoom.AddSmoothly(-d * 500.0f);
++		}
++		return IN_HANDLED;
++	}
++
+ 	switch (ev->ev.type)
+ 	{
+ 	case SDL_HOTKEYPRESS:
+diff -ruN --text a/source/graphics/CameraController.h b/source/graphics/CameraController.h
+--- a/source/graphics/CameraController.h	2025-12-22 11:24:43
++++ b/source/graphics/CameraController.h	2026-09-26 20:42:37
+@@ -74,6 +74,7 @@
+ 	void SetupCameraMatrixSmoothRot(CMatrix3D* orientation);
+ 	void SetupCameraMatrixNonSmooth(CMatrix3D* orientation);
+ 	void FocusHeight(bool smooth);
++	void TouchpadPan(float dxPx, float dyPx);
+ 
+ 	/**
+ 	 * Set projection of current camera using near, far, and FOV values
+@@ -100,6 +101,9 @@
+ 	* Whether the camera is in bird's eye view mode.
+ 	*/
+ 	bool m_BirdsEyeView;
++
++	// Custom SDL event type for OpenHarmony touchpad gestures (0 = unset).
++	unsigned int m_TouchpadGestureEventType;
+ 
+ 	// Settings
+ 	float m_ViewScrollSpeed;
+diff -ruN --text a/source/graphics/Font.cpp b/source/graphics/Font.cpp
+--- a/source/graphics/Font.cpp	2025-12-22 11:24:43
++++ b/source/graphics/Font.cpp	2026-09-27 12:08:39
+@@ -268,20 +268,35 @@
+ 	Renderer::Backend::IDevice* backendDevice = g_Renderer.GetDeviceCommandContext()->GetDevice();
+ 
+ 	// Make backend texture ahead of time.
++	m_HasRGB = true;
++	m_AtlasPadding = 4 + m_StrokeWidth * 2;
++	m_AtlasX = m_AtlasY = 0;
++
++	// Choose the texture format first so we know its byte stride.
++	const Renderer::Backend::Sampler::Desc defaultSamplerDesc{ChooseTextureFormatAndSampler()};
++
+ 	// TODO: calculate based on device support.
++	// CJK locales need thousands of glyphs and a scaled UI makes each glyph
++	// larger, so the legacy 1024px atlas overflows (e.g. the Credits screen,
++	// "Font texture atlas is full, cannot load more glyphs"). On HarmonyOS use a
++	// 4096px single-channel (A8) atlas = 16 MiB; the RGBA stroke atlases stay at
++	// 2048px (also 16 MiB). Other platforms keep the legacy 1024px.
++#if defined(__OHOS__)
++	const uint32_t maxDeviceTextureSize{backendDevice->GetCapabilities().maxTextureSize};
++	const int preferredSize{(m_TextureFormatStride >= 4) ? 4096 : 8192};
++	int textureSize{1024};
++	while (textureSize < preferredSize && textureSize * 2 <= static_cast<int>(maxDeviceTextureSize))
++		textureSize *= 2;
++#else
+ 	const int textureSize{1024};
++#endif
+ 	m_AtlasWidth = textureSize;
+ 	m_AtlasHeight = textureSize;
+-	m_HasRGB = true;
+-	m_AtlasPadding = 4 + m_StrokeWidth * 2;
+-	m_AtlasX = m_AtlasY = 0;
+ 
+ 	m_Bounds.right = textureSize;
+ 	m_Bounds.bottom = textureSize;
+ 
+ 	// TODO: preload from cache?.
+-
+-	const Renderer::Backend::Sampler::Desc defaultSamplerDesc{ChooseTextureFormatAndSampler()};
+ 
+ 	m_AtlasSize = m_AtlasWidth * m_AtlasHeight * m_TextureFormatStride;
+ 
+diff -ruN --text a/source/graphics/GameView.cpp b/source/graphics/GameView.cpp
+--- a/source/graphics/GameView.cpp	2025-12-22 11:24:43
++++ b/source/graphics/GameView.cpp	2026-09-26 18:25:25
+@@ -295,9 +295,10 @@
+ {
+ 	m->MiniMapTexture.Update(deltaRealTime);
+ 
+-	// If camera movement is being handled by the touch-input system,
+-	// then we should stop to avoid conflicting with it
+-	if (g_TouchInput.IsEnabled())
++	// While a two-finger touch camera gesture is in progress, yield to it so we
++	// don't fight over the camera; mouse/keyboard camera control still works
++	// at all other times (important on 2-in-1 devices).
++	if (g_TouchInput.IsCameraGestureActive())
+ 		return;
+ 
+ 	if (!g_app_has_focus)
+@@ -376,9 +377,13 @@
+ 		CSceneRenderer& sceneRenderer = g_Renderer.GetSceneRenderer();
+ 		if (hotkey == "wireframe")
+ 		{
++#if CONFIG2_LOBBY
+ 			if (g_XmppClient && g_rankedGame == true)
+ 				break;
+ 			else if (sceneRenderer.GetModelRenderMode() == SOLID)
++#else
++			if (sceneRenderer.GetModelRenderMode() == SOLID)
++#endif
+ 			{
+ 				sceneRenderer.SetTerrainRenderMode(EDGED_FACES);
+ 				sceneRenderer.SetWaterRenderMode(EDGED_FACES);
+diff -ruN --text a/source/graphics/TextureManager.cpp b/source/graphics/TextureManager.cpp
+--- a/source/graphics/TextureManager.cpp	2025-12-22 11:24:43
++++ b/source/graphics/TextureManager.cpp	2026-09-26 15:26:19
+@@ -741,7 +741,19 @@
+ 			return 0;
+ 		};
+ 
+-		CTexturePtr highPrioritytexture = std::ranges::max(m_TextureCache, {}, getPriority);
++		CTexturePtr highPrioritytexture;
++		int bestPriority = -1;
++		for (const CTexturePtr& tex : m_TextureCache)
++		{
++			int priority = getPriority(tex);
++			if (priority > bestPriority)
++			{
++				bestPriority = priority;
++				highPrioritytexture = tex;
++			}
++		}
++		if (!highPrioritytexture)
++			return false;
+ 
+ 		switch (highPrioritytexture->m_State)
+ 		{
+diff -ruN --text a/source/gui/CGUI.cpp b/source/gui/CGUI.cpp
+--- a/source/gui/CGUI.cpp	2025-12-22 11:24:44
++++ b/source/gui/CGUI.cpp	2026-09-26 19:32:17
+@@ -62,6 +62,7 @@
+ #include <js/ValueArray.h>
+ #include <optional>
+ #include <SDL_events.h>
++#include <SDL_log.h>
+ #include <SDL_mouse.h>
+ #include <stdexcept>
+ #include <string>
+@@ -143,7 +144,7 @@
+ 			}
+ 	}
+ 
+-	else if (ev->ev.type == SDL_MOUSEMOTION)
++	else if (ev->ev.type == SDL_EVENT_MOUSE_MOTION)
+ 	{
+ 		// Yes the mouse position is stored as float to avoid
+ 		//  constant conversions when operating in a
+@@ -155,7 +156,7 @@
+ 	}
+ 
+ 	// Update m_MouseButtons. (BUTTONUP is handled later.)
+-	else if (ev->ev.type == SDL_MOUSEBUTTONDOWN)
++	else if (ev->ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+ 	{
+ 		switch (ev->ev.button.button)
+ 		{
+@@ -171,7 +172,7 @@
+ 
+ 	// Update m_MousePos (for delayed mouse button events)
+ 	CVector2D oldMousePos = m_MousePos;
+-	if (ev->ev.type == SDL_MOUSEBUTTONDOWN || ev->ev.type == SDL_MOUSEBUTTONUP)
++	if (ev->ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN || ev->ev.type == SDL_EVENT_MOUSE_BUTTON_UP)
+ 	{
+ 		m_MousePos = CVector2D((float)ev->ev.button.x / g_VideoMode.GetScale(), (float)ev->ev.button.y / g_VideoMode.GetScale());
+ 	}
+@@ -191,7 +192,7 @@
+ 		// update their own data and send messages accordingly
+ 		m_BaseObject->RecurseObject(&IGUIObject::IsHiddenOrGhostOrOutOfBoundaries, &IGUIObject::UpdateMouseOver, static_cast<IGUIObject* const&>(pNearest));
+ 
+-		if (ev->ev.type == SDL_MOUSEBUTTONDOWN)
++		if (ev->ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+ 		{
+ 			switch (ev->ev.button.button)
+ 			{
+@@ -212,7 +213,7 @@
+ 				break;
+ 			}
+ 		}
+-		else if (ev->ev.type == SDL_MOUSEWHEEL && pNearest)
++		else if (ev->ev.type == SDL_EVENT_MOUSE_WHEEL && pNearest)
+ 		{
+ 			if (ev->ev.wheel.y < 0)
+ 				ret = pNearest->SendMouseEvent(GUIM_MOUSE_WHEEL_DOWN, EventNameMouseWheelDown);
+@@ -224,7 +225,7 @@
+ 			else if (ev->ev.wheel.x > 0)
+ 				ret = pNearest->SendMouseEvent(GUIM_MOUSE_WHEEL_RIGHT, EventNameMouseWheelRight);
+ 		}
+-		else if (ev->ev.type == SDL_MOUSEBUTTONUP)
++		else if (ev->ev.type == SDL_EVENT_MOUSE_BUTTON_UP)
+ 		{
+ 			switch (ev->ev.button.button)
+ 			{
+@@ -263,7 +264,7 @@
+ 	// BUTTONUP's effect on m_MouseButtons is handled after
+ 	// everything else, so that e.g. 'press' handlers (activated
+ 	// on button up) see which mouse button had been pressed.
+-	if (ev->ev.type == SDL_MOUSEBUTTONUP)
++	if (ev->ev.type == SDL_EVENT_MOUSE_BUTTON_UP)
+ 	{
+ 		switch (ev->ev.button.button)
+ 		{
+@@ -278,15 +279,15 @@
+ 	}
+ 
+ 	// Restore m_MousePos (for delayed mouse button events)
+-	if (ev->ev.type == SDL_MOUSEBUTTONDOWN || ev->ev.type == SDL_MOUSEBUTTONUP)
++	if (ev->ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN || ev->ev.type == SDL_EVENT_MOUSE_BUTTON_UP)
+ 		m_MousePos = oldMousePos;
+ 
+ 	// Let GUI items handle keys after everything else, e.g. for input boxes.
+ 	if (ret == IN_PASS && GetFocusedObject())
+ 	{
+-		if (ev->ev.type == SDL_KEYUP || ev->ev.type == SDL_KEYDOWN ||
++		if (ev->ev.type == SDL_EVENT_KEY_UP || ev->ev.type == SDL_EVENT_KEY_DOWN ||
+ 			ev->ev.type == SDL_HOTKEYUP || ev->ev.type == SDL_HOTKEYDOWN ||
+-			ev->ev.type == SDL_TEXTINPUT || ev->ev.type == SDL_TEXTEDITING)
++			ev->ev.type == SDL_EVENT_TEXT_INPUT || ev->ev.type == SDL_EVENT_TEXT_EDITING)
+ 			ret = GetFocusedObject()->ManuallyHandleKeys(ev);
+ 		// else will return IN_PASS because we never used the button.
+ 	}
+diff -ruN --text a/source/gui/ObjectTypes/CDropDown.cpp b/source/gui/ObjectTypes/CDropDown.cpp
+--- a/source/gui/ObjectTypes/CDropDown.cpp	2025-12-29 11:10:28
++++ b/source/gui/ObjectTypes/CDropDown.cpp	2026-09-26 15:27:13
+@@ -277,9 +277,9 @@
+ 	InReaction result = IN_PASS;
+ 	bool update_highlight = false;
+ 
+-	if (ev->ev.type == SDL_KEYDOWN)
++	if (ev->ev.type == SDL_EVENT_KEY_DOWN)
+ 	{
+-		int szChar = ev->ev.key.keysym.sym;
++		int szChar = ev->ev.key.key;
+ 
+ 		switch (szChar)
+ 		{
+@@ -305,7 +305,7 @@
+ 		default:
+ 			// If we have typed a character try to get the closest element to it.
+ 			// TODO: not too nice and doesn't deal with dashes.
+-			if (m_Open && ((szChar >= SDLK_a && szChar <= SDLK_z) || szChar == SDLK_SPACE
++			if (m_Open && ((szChar >= SDLK_A && szChar <= SDLK_Z) || szChar == SDLK_SPACE
+ 						   || (szChar >= SDLK_0 && szChar <= SDLK_9)
+ 						   || (szChar >= SDLK_KP_1 && szChar <= SDLK_KP_0)))
+ 			{
+diff -ruN --text a/source/gui/ObjectTypes/CHotkeyPicker.cpp b/source/gui/ObjectTypes/CHotkeyPicker.cpp
+--- a/source/gui/ObjectTypes/CHotkeyPicker.cpp	2025-12-22 11:24:44
++++ b/source/gui/ObjectTypes/CHotkeyPicker.cpp	2026-09-26 15:27:13
+@@ -110,13 +110,13 @@
+ 	switch (ev->ev.type)
+ 	{
+ 	// Handle the same mouse events that hotkeys handle
+-	case SDL_MOUSEBUTTONDOWN:
+-	case SDL_MOUSEBUTTONUP:
+-	case SDL_MOUSEWHEEL:
++	case SDL_EVENT_MOUSE_BUTTON_DOWN:
++	case SDL_EVENT_MOUSE_BUTTON_UP:
++	case SDL_EVENT_MOUSE_WHEEL:
+ 	{
+ 		SDL_Scancode scancode;
+ 
+-		if (ev->ev.type != SDL_MOUSEWHEEL)
++		if (ev->ev.type != SDL_EVENT_MOUSE_WHEEL)
+ 		{
+ 			// Wait a little bit -> this gets triggered when clicking on a button,
+ 			// but after the button click is processed, thus immediately triggering...
+@@ -150,10 +150,10 @@
+ 
+ 		return IN_HANDLED;
+ 	}
+-	case SDL_KEYDOWN:
+-	case SDL_KEYUP:
++	case SDL_EVENT_KEY_DOWN:
++	case SDL_EVENT_KEY_UP:
+ 	{
+-		SDL_Scancode scancode = ev->ev.key.keysym.scancode;
++		SDL_Scancode scancode = ev->ev.key.scancode;
+ 
+ 		// Don't handle caps-lock, it doesn't really work in-game and it's a weird hotkey.
+ 		if (scancode == SDL_SCANCODE_CAPSLOCK)
+@@ -168,7 +168,7 @@
+ 		else if (scancode == SDL_SCANCODE_LGUI || scancode == SDL_SCANCODE_RGUI)
+ 			scancode = static_cast<SDL_Scancode>(UNIFIED_SUPER);
+ 
+-		if (ev->ev.type == SDL_KEYDOWN)
++		if (ev->ev.type == SDL_EVENT_KEY_DOWN)
+ 		{
+ 			std::vector<Key>::const_iterator it = \
+ 				std::find_if(m_KeysPressed.begin(), m_KeysPressed.end(), [&scancode](Key& k) { return k.code == scancode; });
+diff -ruN --text a/source/gui/ObjectTypes/CInput.cpp b/source/gui/ObjectTypes/CInput.cpp
+--- a/source/gui/ObjectTypes/CInput.cpp	2025-12-22 11:24:44
++++ b/source/gui/ObjectTypes/CInput.cpp	2026-09-26 15:27:47
+@@ -132,7 +132,7 @@
+ 	}
+ 	// SDL2 has a new method of text input that better supports Unicode and CJK
+ 	// see https://wiki.libsdl.org/Tutorials/TextInput
+-	case SDL_TEXTINPUT:
++	case SDL_EVENT_TEXT_INPUT:
+ 	{
+ 		if (m_Readonly)
+ 			return IN_PASS;
+@@ -171,7 +171,7 @@
+ 
+ 		return IN_HANDLED;
+ 	}
+-	case SDL_TEXTEDITING:
++	case SDL_EVENT_TEXT_EDITING:
+ 	{
+ 		if (m_Readonly)
+ 			return IN_PASS;
+@@ -219,13 +219,13 @@
+ 
+ 		return IN_HANDLED;
+ 	}
+-	case SDL_KEYDOWN:
+-	case SDL_KEYUP:
++	case SDL_EVENT_KEY_DOWN:
++	case SDL_EVENT_KEY_UP:
+ 	{
+ 		// Since the GUI framework doesn't handle to set settings
+ 		//  in Unicode (CStrW), we'll simply retrieve the actual
+ 		//  pointer and edit that.
+-		SDL_Keycode keyCode = ev->ev.key.keysym.sym;
++		SDL_Keycode keyCode = ev->ev.key.key;
+ 
+ 		// We have a probably printable key - we should return HANDLED so it can't trigger hotkeys.
+ 		// However, if Ctrl/Meta modifiers are active, just pass it through instead,
+@@ -242,7 +242,7 @@
+ 		if (m_ComposingText)
+ 			return IN_HANDLED;
+ 
+-		if (ev->ev.type == SDL_KEYDOWN)
++		if (ev->ev.type == SDL_EVENT_KEY_DOWN)
+ 		{
+ 			ManuallyImmutableHandleKeyDownEvent(keyCode);
+ 			ManuallyMutableHandleKeyDownEvent(keyCode);
+@@ -345,7 +345,7 @@
+ 	}
+ 	default: // Insert a character
+ 	{
+-		// Regular input is handled via SDL_TEXTINPUT, so we should ignore it here.
++		// Regular input is handled via SDL_EVENT_TEXT_INPUT, so we should ignore it here.
+ 		if (cooked == 0)
+ 			return;
+ 
+@@ -1152,8 +1152,9 @@
+ 		rect.w = m_CachedActualSize.GetSize().Width;
+ 		rect.x = m_CachedActualSize.TopLeft().X;
+ 		rect.y = m_CachedActualSize.TopLeft().Y;
+-		SDL_SetTextInputRect(&rect);
+-		SDL_StartTextInput();
++		SDL_Window* textWindow = SDL_GetKeyboardFocus();
++		SDL_SetTextInputArea(textWindow, &rect, 0);
++		SDL_StartTextInput(textWindow);
+ 		break;
+ 	}
+ 	case GUIM_LOST_FOCUS:
+@@ -1162,13 +1163,14 @@
+ 		{
+ 			// Simulate a final text editing event to clear the composition
+ 			SDL_Event_ evt;
+-			evt.ev.type = SDL_TEXTEDITING;
++			evt.ev.type = SDL_EVENT_TEXT_EDITING;
++			static const char* s_emptyEditText = "";
+ 			evt.ev.edit.length = 0;
+ 			evt.ev.edit.start = 0;
+-			evt.ev.edit.text[0] = 0;
++			evt.ev.edit.text = s_emptyEditText;
+ 			ManuallyHandleKeys(&evt);
+ 		}
+-		SDL_StopTextInput();
++		SDL_StopTextInput(SDL_GetKeyboardFocus());
+ 
+ 		m_iBufferPos = -1;
+ 		m_iBufferPos_Tail = -1;
+diff -ruN --text a/source/gui/ObjectTypes/CList.cpp b/source/gui/ObjectTypes/CList.cpp
+--- a/source/gui/ObjectTypes/CList.cpp	2025-12-22 11:24:44
++++ b/source/gui/ObjectTypes/CList.cpp	2026-09-26 15:27:13
+@@ -264,9 +264,9 @@
+ {
+ 	InReaction result = IN_PASS;
+ 
+-	if (ev->ev.type == SDL_KEYDOWN)
++	if (ev->ev.type == SDL_EVENT_KEY_DOWN)
+ 	{
+-		int szChar = ev->ev.key.keysym.sym;
++		int szChar = ev->ev.key.key;
+ 
+ 		switch (szChar)
+ 		{
+diff -ruN --text a/source/gui/Scripting/GuiScriptConversions.cpp b/source/gui/Scripting/GuiScriptConversions.cpp
+--- a/source/gui/Scripting/GuiScriptConversions.cpp	2025-12-22 11:24:44
++++ b/source/gui/Scripting/GuiScriptConversions.cpp	2026-09-26 15:29:11
+@@ -61,13 +61,12 @@
+ 
+ 	switch (val.ev.type)
+ 	{
+-	case SDL_WINDOWEVENT: typeName = "windowevent"; break;
+-	case SDL_KEYDOWN: typeName = "keydown"; break;
+-	case SDL_KEYUP: typeName = "keyup"; break;
+-	case SDL_MOUSEMOTION: typeName = "mousemotion"; break;
+-	case SDL_MOUSEBUTTONDOWN: typeName = "mousebuttondown"; break;
+-	case SDL_MOUSEBUTTONUP: typeName = "mousebuttonup"; break;
+-	case SDL_QUIT: typeName = "quit"; break;
++	case SDL_EVENT_KEY_DOWN: typeName = "keydown"; break;
++	case SDL_EVENT_KEY_UP: typeName = "keyup"; break;
++	case SDL_EVENT_MOUSE_MOTION: typeName = "mousemotion"; break;
++	case SDL_EVENT_MOUSE_BUTTON_DOWN: typeName = "mousebuttondown"; break;
++	case SDL_EVENT_MOUSE_BUTTON_UP: typeName = "mousebuttonup"; break;
++	case SDL_EVENT_QUIT: typeName = "quit"; break;
+ 	case SDL_HOTKEYPRESS: typeName = "hotkeypress"; break;
+ 	case SDL_HOTKEYDOWN: typeName = "hotkeydown"; break;
+ 	case SDL_HOTKEYUP: typeName = "hotkeyup"; break;
+@@ -87,8 +86,8 @@
+ 
+ 	switch (val.ev.type)
+ 	{
+-	case SDL_KEYDOWN:
+-	case SDL_KEYUP:
++	case SDL_EVENT_KEY_DOWN:
++	case SDL_EVENT_KEY_UP:
+ 	{
+ 		// SET(obj, "which", (int)val.ev.key.which); // (not in wsdl.h)
+ 		// SET(obj, "state", (int)val.ev.key.state); // (not in wsdl.h)
+@@ -102,9 +101,9 @@
+ 		JS::RootedValue keysymVal(rq.cx, JS::ObjectValue(*keysym));
+ 		JS_SetProperty(rq.cx, obj, "keysym", keysymVal);
+ 
+-		// SET(keysym, "scancode", (int)val.ev.key.keysym.scancode); // (not in wsdl.h)
+-		SET(keysym, "sym", (int)val.ev.key.keysym.sym);
+-		// SET(keysym, "mod", (int)val.ev.key.keysym.mod); // (not in wsdl.h)
++		// SET(keysym, "scancode", (int)val.ev.key.scancode); // (not in wsdl.h)
++		SET(keysym, "sym", (int)val.ev.key.key);
++		// SET(keysym, "mod", (int)val.ev.key.mod); // (not in wsdl.h)
+ 		{
+ 			SET(keysym, "unicode", JS::UndefinedHandleValue);
+ 		}
+@@ -113,7 +112,7 @@
+ 
+ 		break;
+ 	}
+-	case SDL_MOUSEMOTION:
++	case SDL_EVENT_MOUSE_MOTION:
+ 	{
+ 		// SET(obj, "which", (int)val.ev.motion.which); // (not in wsdl.h)
+ 		// SET(obj, "state", (int)val.ev.motion.state); // (not in wsdl.h)
+@@ -123,12 +122,12 @@
+ 		// SET(obj, "yrel", (int)val.ev.motion.yrel); // (not in wsdl.h)
+ 		break;
+ 	}
+-	case SDL_MOUSEBUTTONDOWN:
+-	case SDL_MOUSEBUTTONUP:
++	case SDL_EVENT_MOUSE_BUTTON_DOWN:
++	case SDL_EVENT_MOUSE_BUTTON_UP:
+ 	{
+ 		// SET(obj, "which", (int)val.ev.button.which); // (not in wsdl.h)
+ 		SET(obj, "button", (int)val.ev.button.button);
+-		SET(obj, "state", (int)val.ev.button.state);
++		SET(obj, "state", (int)val.ev.button.down);
+ 		SET(obj, "x", (int)val.ev.button.x);
+ 		SET(obj, "y", (int)val.ev.button.y);
+ 		SET(obj, "clicks", (int)val.ev.button.clicks);
+diff -ruN --text a/source/gui/Scripting/ScriptFunctions.cpp b/source/gui/Scripting/ScriptFunctions.cpp
+--- a/source/gui/Scripting/ScriptFunctions.cpp	2025-12-22 11:24:44
++++ b/source/gui/Scripting/ScriptFunctions.cpp	2026-09-26 17:27:31
+@@ -63,6 +63,8 @@
+ 	JSI_GameView::RegisterScriptFunctions(rq);
+ 	JSI_Hotkey::RegisterScriptFunctions(rq);
+ 	JSI_L10n::RegisterScriptFunctions(rq);
++	// Always register the lobby JS surface: with CONFIG2_LOBBY=0 it still adds
++	// HasXmppClient/SetRankedGame, which the GameSetup scripts call unconditionally.
+ 	JSI_Lobby::RegisterScriptFunctions(rq);
+ 	JSI_Main::RegisterScriptFunctions(rq);
+ 	JSI_Mod::RegisterScriptFunctions(rq);
+diff -ruN --text a/source/gui/tests/test_GuiManager.h b/source/gui/tests/test_GuiManager.h
+--- a/source/gui/tests/test_GuiManager.h	2025-12-22 11:24:45
++++ b/source/gui/tests/test_GuiManager.h	2026-09-26 15:25:01
+@@ -161,7 +161,7 @@
+ 
+ 		// Press 'a'.
+ 		SDL_Event_ hotkeyNotification;
+-		hotkeyNotification.ev.type = SDL_KEYDOWN;
++		hotkeyNotification.ev.type = SDL_EVENT_KEY_DOWN;
+ 		hotkeyNotification.ev.key.keysym.scancode = SDL_SCANCODE_A;
+ 		hotkeyNotification.ev.key.repeat = 0;
+ 
+@@ -205,7 +205,7 @@
+ 		Script::FromJSVal(prq, js_hotkey_pressed_value, hotkey_pressed_value);
+ 		TS_ASSERT_EQUALS(hotkey_pressed_value, true);
+ 
+-		hotkeyNotification.ev.type = SDL_KEYUP;
++		hotkeyNotification.ev.type = SDL_EVENT_KEY_UP;
+ 		in_push_priority_event(&hotkeyNotification);
+ 		while (in_poll_event(&ev))
+ 			in_dispatch_event(&ev);
+diff -ruN --text a/source/lib/external_libraries/libsdl.cpp b/source/lib/external_libraries/libsdl.cpp
+--- a/source/lib/external_libraries/libsdl.cpp	2025-12-22 11:24:45
++++ b/source/lib/external_libraries/libsdl.cpp	2026-09-26 15:29:11
+@@ -27,7 +27,7 @@
+ #include "lib/debug.h"
+ 
+ #include <SDL_error.h>
+-#include <SDL_syswm.h>
++#include <SDL_video.h>
+ 
+ #if defined(SDL_VIDEO_DRIVER_X11) && !CONFIG2_GLES
+ void* GetX11Display(SDL_Window* window)
+@@ -59,72 +59,9 @@
+ 
+ const char* GetSDLSubsystem(SDL_Window* window)
+ {
+-	SDL_SysWMinfo wminfo;
+-	// The info structure must be initialized with the SDL version.
+-	SDL_VERSION(&wminfo.version);
+-
+-	if (!SDL_GetWindowWMInfo(window, &wminfo))
+-	{
+-		debug_printf("Failed to query SDL WM info: %s", SDL_GetError());
+-		return nullptr;
+-	}
+-
+-	const char* subsystem = "unknown";
+-	switch (wminfo.subsystem)
+-	{
+-	case SDL_SYSWM_WAYLAND:
+-		subsystem = "Wayland";
+-		break;
+-	case SDL_SYSWM_X11:
+-		subsystem = "X11";
+-		break;
+-	case SDL_SYSWM_WINDOWS:
+-		subsystem = "Windows";
+-		break;
+-	case SDL_SYSWM_COCOA:
+-		subsystem = "Cocoa";
+-		break;
+-	case SDL_SYSWM_UIKIT:
+-		subsystem = "UIKit";
+-		break;
+-	case SDL_SYSWM_DIRECTFB:
+-		subsystem = "DirectFB";
+-		break;
+-	case SDL_SYSWM_MIR:
+-		subsystem = "Mir";
+-		break;
+-#if SDL_VERSION_ATLEAST(2, 0, 3)
+-	case SDL_SYSWM_WINRT:
+-		subsystem = "WinRT";
+-		break;
+-#endif
+-#if SDL_VERSION_ATLEAST(2, 0, 4)
+-	case SDL_SYSWM_ANDROID:
+-		subsystem = "Android";
+-		break;
+-#endif
+-#if SDL_VERSION_ATLEAST(2, 0, 5)
+-	case SDL_SYSWM_VIVANTE:
+-		subsystem = "Vivante";
+-		break;
+-#endif
+-#if SDL_VERSION_ATLEAST(2, 0, 6)
+-	case SDL_SYSWM_OS2:
+-		subsystem = "OS/2";
+-		break;
+-#endif
+-#if SDL_VERSION_ATLEAST(2, 0, 12)
+-	case SDL_SYSWM_HAIKU:
+-		subsystem = "Haiku";
+-		break;
+-#endif
+-#if SDL_VERSION_ATLEAST(2, 0, 11)
+-	default:
+-		debug_printf("Unknown platform, please add it to source/lib/external_libraries/libsdl.cpp\n");
+-#endif
+-	case SDL_SYSWM_UNKNOWN:
+-		break;
+-	}
+-
+-	return subsystem;
++	(void)window;
++	// SDL3 removed SDL_GetWindowWMInfo; the active video driver name gives us
++	// the same information for diagnostics (e.g. "openharmony").
++	const char* driver = SDL_GetCurrentVideoDriver();
++	return driver ? driver : "unknown";
+ }
+diff -ruN --text a/source/lib/input.cpp b/source/lib/input.cpp
+--- a/source/lib/input.cpp	2025-12-22 11:24:46
++++ b/source/lib/input.cpp	2026-09-26 19:32:17
+@@ -33,6 +33,7 @@
+ #include "lib/status.h"
+ 
+ #include <SDL_events.h>
++#include <SDL_log.h>
+ #include <cstddef>
+ #include <list>
+ 
+diff -ruN --text a/source/lib/ogl.cpp b/source/lib/ogl.cpp
+--- a/source/lib/ogl.cpp	2025-12-22 11:24:46
++++ b/source/lib/ogl.cpp	2026-09-26 15:46:38
+@@ -34,7 +34,7 @@
+ #if !CONFIG2_GLES
+ # if OS_WIN
+ #  include <glad/wgl.h>
+-# elif !OS_MACOSX
++# elif !OS_MACOSX && !OS_HARMONYOS
+ #  include <SDL_config.h>
+ #  include <SDL_syswm.h>
+ #  if defined(SDL_VIDEO_DRIVER_X11)
+@@ -424,7 +424,7 @@
+ 
+ #if OS_WIN
+ bool ogl_Init(void* (load)(const char*), void* hdc)
+-#elif !CONFIG2_GLES && !OS_MACOSX
++#elif !CONFIG2_GLES && !OS_MACOSX && !OS_HARMONYOS
+ bool ogl_Init(void* (load)(const char*), void* display, int subsystem)
+ #else
+ bool ogl_Init(void* (load)(const char*))
+@@ -454,7 +454,7 @@
+ 		LOAD_ERROR("Failed to load WGL functions.");
+ 		return false;
+ 	}
+-# elif !OS_MACOSX
++# elif !OS_MACOSX && !OS_HARMONYOS
+ 	const SDL_SYSWM_TYPE sysWMType = static_cast<SDL_SYSWM_TYPE>(subsystem);
+ #  if defined(SDL_VIDEO_DRIVER_X11)
+ 	if (sysWMType == SDL_SYSWM_X11)
+diff -ruN --text a/source/lib/ogl.h b/source/lib/ogl.h
+--- a/source/lib/ogl.h	2025-12-22 11:24:46
++++ b/source/lib/ogl.h	2026-09-27 00:45:17
+@@ -38,6 +38,69 @@
+ # include <glad/gl.h>
+ #endif
+ 
++#if OS_HARMONYOS
++// HarmonyOS backs the desktop GL backend with an OpenGL ES based context. The
++// glad desktop loader leaves some EXT-suffixed entry points pointing at an
++// implementation that crashes, so alias those framebuffer entry points (and
++// their constants) to the GLES core versions.
++# define glBindFramebufferEXT glBindFramebuffer
++# define glGenFramebuffersEXT glGenFramebuffers
++# define glDeleteFramebuffersEXT glDeleteFramebuffers
++# define glCheckFramebufferStatusEXT glCheckFramebufferStatus
++# define glFramebufferTexture2DEXT glFramebufferTexture2D
++# define glBlitFramebufferEXT glBlitFramebuffer
++# define GL_FRAMEBUFFER_EXT GL_FRAMEBUFFER
++# define GL_FRAMEBUFFER_COMPLETE_EXT GL_FRAMEBUFFER_COMPLETE
++# define GL_READ_FRAMEBUFFER_EXT GL_READ_FRAMEBUFFER
++# define GL_DRAW_FRAMEBUFFER_EXT GL_DRAW_FRAMEBUFFER
++
++// Buffer objects (GL_ARB_vertex_buffer_object names -> GLES core names).
++# define glGenBuffersARB glGenBuffers
++# define glBindBufferARB glBindBuffer
++# define glDeleteBuffersARB glDeleteBuffers
++# define glBufferDataARB glBufferData
++# define glBufferSubDataARB glBufferSubData
++# define glUnmapBufferARB glUnmapBuffer
++
++// Instancing: engine code uses un-suffixed names, but this glad header only
++// declares ARB pointers. gl.cpp loads those ARB pointers via the un-suffixed
++// GLES names, so map the engine names to the (populated) ARB pointers.
++# define glDrawArraysInstanced glDrawArraysInstancedARB
++# define glDrawElementsInstanced glDrawElementsInstancedARB
++# define glVertexAttribDivisor glVertexAttribDivisorARB
++
++// Queries (GLES3 core, ARB suffix stripped).
++# define glGenQueriesARB glGenQueries
++# define glDeleteQueriesARB glDeleteQueries
++# define glBeginQueryARB glBeginQuery
++# define glEndQueryARB glEndQuery
++# define glGetQueryivARB glGetQueryiv
++# define glGetQueryObjectivARB glGetQueryObjectiv
++
++// Misc core names.
++# define glCompressedTexImage2DARB glCompressedTexImage2D
++# define glDrawRangeElementsEXT glDrawRangeElements
++# define glDiscardFramebufferEXT glInvalidateFramebuffer
++
++// glMapBuffer does not exist in GLES; emulate whole-buffer write mapping via
++// glMapBufferRange (GL_ARB_map_buffer_range loader resolves it on GLES3).
++static inline void* OH_MapBufferForWrite(GLenum target, GLenum access)
++{
++	GLint bufSize = 0;
++	glGetBufferParameteriv(target, GL_BUFFER_SIZE, &bufSize);
++	if (bufSize <= 0) return NULL;
++	GLbitfield bits;
++	if (access == GL_READ_ONLY)
++		bits = GL_MAP_READ_BIT;
++	else if (access == GL_READ_WRITE)
++		bits = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
++	else
++		bits = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT;
++	return glMapBufferRange(target, 0, (GLsizeiptr)bufSize, bits);
++}
++# define glMapBufferARB OH_MapBufferForWrite
++#endif
++
+ /**
+  * initialization: import extension function pointers and do feature detect.
+  * call before using any other function.
+@@ -46,7 +109,7 @@
+  **/
+ #if OS_WIN
+ extern bool ogl_Init(void* (load)(const char*), void* hdc);
+-#elif !OS_MACOSX && !CONFIG2_GLES
++#elif !OS_MACOSX && !CONFIG2_GLES && !OS_HARMONYOS
+ extern bool ogl_Init(void* (load)(const char*), void* display, int subsystem);
+ #else
+ extern bool ogl_Init(void* (load)(const char*));
+diff -ruN --text a/source/lib/sysdep/os/linux/dir_watch_inotify.cpp b/source/lib/sysdep/os/linux/dir_watch_inotify.cpp
+--- a/source/lib/sysdep/os/linux/dir_watch_inotify.cpp	2025-12-22 11:24:46
++++ b/source/lib/sysdep/os/linux/dir_watch_inotify.cpp	2026-09-26 15:30:58
+@@ -98,8 +98,8 @@
+ {
+ 	close(inotifyfd);
+ 
+-#ifdef __BIONIC__
+-	#warning TODO: pthread_cancel not supported on Bionic
++#if defined(__BIONIC__) || defined(__OHOS__)
++	#warning TODO: pthread_cancel not supported on Bionic/OHOS
+ #else
+ 	pthread_cancel(g_event_loop_thread);
+ #endif
+diff -ruN --text a/source/lib/sysdep/os/unix/unix.cpp b/source/lib/sysdep/os/unix/unix.cpp
+--- a/source/lib/sysdep/os/unix/unix.cpp	2025-12-22 11:24:46
++++ b/source/lib/sysdep/os/unix/unix.cpp	2026-09-27 12:02:44
+@@ -40,6 +40,10 @@
+ #include <cstring>
+ #include <string>
+ 
++#if defined(__OHOS__)
++#include <SDL3/SDL_misc.h>
++#endif
++
+ #define GNU_SOURCE
+ 
+ #include <sys/wait.h>
+@@ -353,6 +357,13 @@
+ 
+ Status sys_open_url(const std::string& url)
+ {
++#if defined(__OHOS__)
++	// No xdg-open on the device; route through SDL, which calls the ability's
++	// openExternalUrl and opens the default browser via an implicit Want.
++	if (SDL_OpenURL(url.c_str()) == 0)
++		return INFO::OK;
++	return ERR::FAIL;
++#else
+ 	pid_t pid = fork();
+ 	if (pid < 0)
+ 	{
+@@ -379,6 +390,7 @@
+ 
+ 		return INFO::OK;
+ 	}
++#endif
+ }
+ 
+ FILE* sys_OpenFile(const OsPath& pathname, const char* mode)
+diff -ruN --text a/source/lib/sysdep/os.h b/source/lib/sysdep/os.h
+--- a/source/lib/sysdep/os.h	2025-12-22 11:24:47
++++ b/source/lib/sysdep/os.h	2026-09-26 14:02:10
+@@ -60,6 +60,12 @@
+ #else
+ # define OS_ANDROID 0
+ #endif
++// HarmonyOS / OpenHarmony (subset of Linux, musl libc)
++#if defined(__OHOS__)
++# define OS_HARMONYOS 1
++#else
++# define OS_HARMONYOS 0
++#endif
+ // Mac OS X
+ #if (defined(__APPLE__) && defined(__MACH__))
+ # define OS_MACOSX 1
+diff -ruN --text a/source/lobby/XmppClient.cpp b/source/lobby/XmppClient.cpp
+--- a/source/lobby/XmppClient.cpp	2026-01-30 15:21:15
++++ b/source/lobby/XmppClient.cpp	2026-09-27 09:38:40
+@@ -122,6 +122,16 @@
+ 	// Security risks from malicious JS mods can be mitigated if this option and also the hostname and login are shielded from JS access.
+ 	m_client->setTls(g_ConfigDB.Get("lobby.tls", true) ? gloox::TLSRequired : gloox::TLSDisabled);
+ 
++#if OS_HARMONYOS
++	// The device has no OpenSSL-visible system CA store; use the CA bundle the
++	// bootstrap writes into the config dir for the XMPP-TLS handshake.
++	{
++		gloox::StringList caCerts;
++		caCerts.push_back("/data/storage/el2/base/haps/entry/files/0ad/config/cacert.pem");
++		m_client->setCACerts(caCerts);
++	}
++#endif
++
+ 	// Disable use of the SASL PLAIN mechanism, to prevent leaking credentials
+ 	// if the server doesn't list any supported SASL mechanism or the response
+ 	// has been modified to exclude those.
+diff -ruN --text a/source/lobby/scripting/JSInterface_Lobby.cpp b/source/lobby/scripting/JSInterface_Lobby.cpp
+--- a/source/lobby/scripting/JSInterface_Lobby.cpp	2025-12-22 11:24:47
++++ b/source/lobby/scripting/JSInterface_Lobby.cpp	2026-09-26 20:59:59
+@@ -27,7 +27,9 @@
+ #include "lib/utf8.h"
+ #include "lobby/IXmppClient.h"
+ #include "network/NetServer.h"
++#include "ps/ConfigDB.h"
+ #include "ps/CLogger.h"
++#include <stdexcept>
+ #include "ps/CStr.h"
+ #include "ps/Util.h"
+ #include "scriptinterface/FunctionWrapper.h"
+@@ -60,7 +62,9 @@
+ 
+ void StartXmppClient(const std::wstring& username, const std::wstring& password, const std::wstring& room,
+ 	const std::wstring& nick, int historyRequestSize)
+-{
++{	if (!g_ConfigDB.Get("network.enabled", true))
++		throw std::runtime_error("Networking is disabled (set network.enabled = true in the options).");
++
+ 	if (g_XmppClient)
+ 		throw std::logic_error{"Cannot call StartXmppClient with an already initialized XmppClient!"};
+ 
+@@ -77,7 +81,9 @@
+ }
+ 
+ void StartRegisterXmppClient(const std::wstring& username, const std::wstring& password)
+-{
++{	if (!g_ConfigDB.Get("network.enabled", true))
++		throw std::runtime_error("Networking is disabled (set network.enabled = true in the options).");
++
+ 	if (g_XmppClient)
+ 	{
+ 		throw std::logic_error{
+diff -ruN --text a/source/main.cpp b/source/main.cpp
+--- a/source/main.cpp	2026-01-30 15:21:15
++++ b/source/main.cpp	2026-09-26 19:32:49
+@@ -65,6 +65,9 @@
+ #include "ps/GameSetup/Config.h"
+ #include "ps/GameSetup/GameSetup.h"
+ #include "ps/GameSetup/Paths.h"
++#if OS_HARMONYOS
++#include "ohos_cli.h"
++#endif
+ #include "ps/Globals.h"
+ #include "ps/Hotkey.h"
+ #include "ps/Loader.h"
+@@ -91,6 +94,7 @@
+ #include "soundmanager/ISoundManager.h"
+ 
+ #include <SDL_events.h>
++#include <SDL_log.h>
+ #include <SDL_stdinc.h>
+ #include <SDL_timer.h>
+ #include <SDL_video.h>
+@@ -199,29 +203,24 @@
+ {
+ 	switch(ev->ev.type)
+ 	{
+-	case SDL_WINDOWEVENT:
+-		switch(ev->ev.window.event)
+-		{
+-		case SDL_WINDOWEVENT_RESIZED:
+-			g_ResizedW = ev->ev.window.data1;
+-			g_ResizedH = ev->ev.window.data2;
+-			break;
+-		case SDL_WINDOWEVENT_MOVED:
+-			g_VideoMode.UpdatePosition(ev->ev.window.data1, ev->ev.window.data2);
+-		}
++	case SDL_EVENT_WINDOW_RESIZED:
++		g_ResizedW = ev->ev.window.data1;
++		g_ResizedH = ev->ev.window.data2;
+ 		break;
++	case SDL_EVENT_WINDOW_MOVED:
++		g_VideoMode.UpdatePosition(ev->ev.window.data1, ev->ev.window.data2);
++		break;
+ 
+-	case SDL_QUIT:
++	case SDL_EVENT_QUIT:
+ 		QuitEngine(EXIT_SUCCESS);
+ 		break;
+ 
+-	case SDL_DROPFILE:
++	case SDL_EVENT_DROP_FILE:
+ 	{
+-		char* dropped_filedir = ev->ev.drop.file;
++		const char* dropped_filedir = ev->ev.drop.data;
+ 		const Paths paths(g_CmdLineArgs);
+ 		CModInstaller installer(paths.UserData() / "mods", paths.Cache());
+ 		installer.Install(std::string(dropped_filedir), g_ScriptContext, true);
+-		SDL_free(dropped_filedir);
+ 		if (installer.GetInstalledMods().empty())
+ 			LOGERROR("Failed to install mod %s", dropped_filedir);
+ 		else
+@@ -264,8 +263,8 @@
+ 		else if (hotkey == "mousegrabtoggle")
+ 		{
+ 			SDL_Window* const window{g_VideoMode.GetWindow()};
+-			const SDL_bool willGrabMouse{SDL_GetWindowGrab(window) ? SDL_FALSE : SDL_TRUE};
+-			SDL_SetWindowGrab(window, willGrabMouse);
++			const bool willGrabMouse{!SDL_GetWindowMouseGrab(window)};
++			SDL_SetWindowMouseGrab(window, willGrabMouse);
+ 		}
+ 		break;
+ 	}
+@@ -449,6 +448,12 @@
+ 		g_ResizedW = g_ResizedH = 0;
+ 	}
+ 
++#if OS_HARMONYOS
++	// Safety net for free-form window resizes that never reach us as an SDL
++	// EVENT_WINDOW_RESIZED through the XComponent OnSurfaceChanged callback.
++	g_VideoMode.HarmonyPollSurfaceSize();
++#endif
++
+ 	if (g_NetClient)
+ 		g_NetClient->Poll();
+ 
+@@ -472,14 +477,21 @@
+ 		g_Game->GetView()->Update(float(realTimeSinceLastFrame));
+ 	}
+ 
++#if CONFIG2_LOBBY
+ 	// Keep us connected to any XMPP servers
+ 	if (g_XmppClient)
+ 		g_XmppClient->recv();
++#endif
+ 
+ 	g_UserReporter.Update();
+ 
+ 	g_Console->Update(realTimeSinceLastFrame);
+ 
++#if OS_HARMONYOS
++	// Run queued CLI commands on the engine main thread once per frame.
++	OhosCli_Pump();
++#endif
++
+ 	if (g_SoundManager)
+ 		g_SoundManager->IdleTask();
+ 
+@@ -797,9 +809,10 @@
+ #endif
+ }
+ 
+-#if OS_ANDROID
+-// In Android we compile the engine as a shared library, not an executable,
+-// so rename main() to a different symbol that the wrapper library can load
++#if OS_ANDROID || OS_HARMONYOS
++// On Android / HarmonyOS we compile the engine as a shared library, not an
++// executable, so rename main() to a different symbol that the wrapper library
++// (SDL_main shim) can load.
+ extern "C" __attribute__((visibility ("default"))) int pyrogenesis_main(int argc, char* argv[])
+ #else
+ int main(int argc, char* argv[])
+diff -ruN --text a/source/network/NetServer.cpp b/source/network/NetServer.cpp
+--- a/source/network/NetServer.cpp	2025-12-22 11:24:48
++++ b/source/network/NetServer.cpp	2026-09-26 20:59:59
+@@ -209,8 +209,9 @@
+ 	m_WorkerThread = std::thread(Threading::HandleExceptions<RunThread>::Wrapper, this);
+ 
+ #if CONFIG2_MINIUPNPC
+-	// Launch the UPnP thread
+-	m_UPnPThread = std::thread(Threading::HandleExceptions<SetupUPnP>::Wrapper, port);
++	// Launch the UPnP thread (unless port mapping is disabled in options)
++	if (g_ConfigDB.Get("network.upnp", true))
++		m_UPnPThread = std::thread(Threading::HandleExceptions<SetupUPnP>::Wrapper, port);
+ #endif
+ 
+ 	return true;
+diff -ruN --text a/source/network/scripting/JSInterface_Network.cpp b/source/network/scripting/JSInterface_Network.cpp
+--- a/source/network/scripting/JSInterface_Network.cpp	2025-12-22 11:24:48
++++ b/source/network/scripting/JSInterface_Network.cpp	2026-09-26 20:59:59
+@@ -27,6 +27,7 @@
+ #include "network/NetClient.h"
+ #include "network/NetMessage.h"
+ #include "network/NetServer.h"
++#include "ps/ConfigDB.h"
+ #include "ps/CLogger.h"
+ #include "ps/CStr.h"
+ #include "ps/GUID.h"
+@@ -78,6 +79,9 @@
+ void StartNetworkHost(const CStrW& playerName, const u16 serverPort, const CStr& password,
+ 	const bool continueSavedGame, bool storeReplay)
+ {
++	if (!g_ConfigDB.Get("network.enabled", true))
++		throw std::runtime_error("Networking is disabled (set network.enabled = true in the options).");
++
+ 	ENSURE(!g_NetClient);
+ 	ENSURE(!g_NetServer);
+ 	ENSURE(!g_Game);
+@@ -147,6 +151,9 @@
+ 
+ void StartNetworkJoin(const CStrW& playerName, const CStr& serverAddress, u16 serverPort, bool storeReplay)
+ {
++	if (!g_ConfigDB.Get("network.enabled", true))
++		throw std::runtime_error("Networking is disabled (set network.enabled = true in the options).");
++
+ 	ENSURE(!g_NetClient);
+ 	ENSURE(!g_NetServer);
+ 	ENSURE(!g_Game);
+@@ -171,6 +178,9 @@
+  */
+ void StartNetworkJoinLobby(const CStrW& playerName, const CStr& hostJID, const CStr& password)
+ {
++	if (!g_ConfigDB.Get("network.enabled", true))
++		throw std::runtime_error("Networking is disabled (set network.enabled = true in the options).");
++
+ 	ENSURE(!!g_XmppClient);
+ 	ENSURE(!g_NetClient);
+ 	ENSURE(!g_NetServer);
+diff -ruN --text a/source/ps/CConsole.cpp b/source/ps/CConsole.cpp
+--- a/source/ps/CConsole.cpp	2026-01-05 11:10:32
++++ b/source/ps/CConsole.cpp	2026-09-26 15:34:30
+@@ -164,10 +164,10 @@
+ 	if (m_Visible)
+ 	{
+ 		ShowQuitHotkeys();
+-		SDL_StartTextInput();
++		SDL_StartTextInput(SDL_GetKeyboardFocus());
+ 		return;
+ 	}
+-	SDL_StopTextInput();
++	SDL_StopTextInput(SDL_GetKeyboardFocus());
+ }
+ 
+ void CConsole::SetVisible(bool visible)
+@@ -673,9 +673,9 @@
+ 		debug_printf("FILES| Failed to write console command history to '%s'\n", m_HistoryFile.string8().c_str());
+ }
+ 
+-static bool isUnprintableChar(SDL_Keysym key)
++static bool isUnprintableChar(SDL_Keycode key)
+ {
+-	switch (key.sym)
++	switch (key)
+ 	{
+ 	// We want to allow some, which are handled specially
+ 	case SDLK_RETURN: case SDLK_TAB:
+@@ -734,7 +734,7 @@
+ 
+ 	// In SDL2, we no longer get Unicode wchars via SDL_Keysym
+ 	// we use text input events instead and they provide UTF-8 chars
+-	if (ev->ev.type == SDL_TEXTINPUT)
++	if (ev->ev.type == SDL_EVENT_TEXT_INPUT)
+ 	{
+ 		// TODO: this could be more efficient with an interface to insert UTF-8 strings directly
+ 		std::wstring wstr = wstring_from_utf8(ev->ev.text.text);
+@@ -744,13 +744,13 @@
+ 	}
+ 	// TODO: text editing events for IME support
+ 
+-	if (ev->ev.type != SDL_KEYDOWN && ev->ev.type != SDL_KEYUP)
++	if (ev->ev.type != SDL_EVENT_KEY_DOWN && ev->ev.type != SDL_EVENT_KEY_UP)
+ 		return IN_PASS;
+ 
+-	int sym = ev->ev.key.keysym.sym;
++	int sym = ev->ev.key.key;
+ 
+ 	// Stop unprintable characters (ctrl+, alt+ and escape).
+-	if (ev->ev.type == SDL_KEYDOWN && isUnprintableChar(ev->ev.key.keysym) &&
++	if (ev->ev.type == SDL_EVENT_KEY_DOWN && isUnprintableChar(ev->ev.key.key) &&
+ 		!HotkeyIsPressed("console.toggle"))
+ 	{
+ 		g_Console->InsertChar(sym, 0);
+diff -ruN --text a/source/ps/GameSetup/GameSetup.cpp b/source/ps/GameSetup/GameSetup.cpp
+--- a/source/ps/GameSetup/GameSetup.cpp	2025-12-29 11:10:28
++++ b/source/ps/GameSetup/GameSetup.cpp	2026-09-26 22:13:43
+@@ -97,6 +97,7 @@
+ #include <SDL_error.h>
+ #include <SDL_hints.h>
+ #include <SDL_keyboard.h>
++#include <SDL_locale.h>
+ #include <SDL_version.h>
+ #include <algorithm>
+ #include <boost/algorithm/string/classification.hpp>
+@@ -122,7 +123,7 @@
+ #include <utility>
+ 
+ 
+-#if !(OS_WIN || OS_MACOSX || OS_ANDROID) // assume all other platforms use X11 for wxWidgets
++#if !(OS_WIN || OS_MACOSX || OS_ANDROID || OS_HARMONYOS) // assume all other platforms use X11 for wxWidgets
+ #define MUST_INIT_X11 1
+ #include <X11/Xlib.h>
+ #else
+@@ -313,21 +314,31 @@
+ 	setenv("SDL_VIDEO_X11_DGAMOUSE", "0", 0);
+ #endif
+ 
+-	if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER|SDL_INIT_NOPARACHUTE) < 0)
++	if(SDL_Init(SDL_INIT_VIDEO) < 0)
+ 	{
+ 		LOGERROR("SDL library initialization failed: %s", SDL_GetError());
+ 		throw PSERROR_System_SDLInitFailed();
+ 	}
++	// Audio is optional: OpenAL's SDL3 backend plays through it. Don't abort
++	// startup if the platform has no audio backend yet.
++	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0)
++		LOGWARNING("SDL audio initialization failed: %s", SDL_GetError());
+ 	atexit(SDL_Quit);
+ 
+ 	// Text input is active by default, disable it until it is actually needed.
+-	SDL_StopTextInput();
++	SDL_StopTextInput(SDL_GetKeyboardFocus());
+ 
+ #if SDL_VERSION_ATLEAST(2, 0, 9)
+ 	// SDL2 >= 2.0.9 defaults to 32 pixels (to support touch screens) but that can break our double-clicking.
+ 	SDL_SetHint(SDL_HINT_MOUSE_DOUBLE_CLICK_RADIUS, "1");
+ #endif
+ 
++	// We perform our own touch -> mouse mapping in CTouchInput (tap = left click,
++	// drag = band-box selection, long-press = right click). Disable SDL's
++	// automatic touch-to-mouse synthesis so it does not duplicate our injected
++	// mouse events and break the selection gesture.
++	SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
++
+ #if SDL_VERSION_ATLEAST(2, 0, 14) && OS_WIN
+ 	// SDL2 >= 2.0.14 Before SDL 2.0.14, this defaulted to true. In 2.0.14 they switched to false
+ 	// breaking the behavior on Windows.
+@@ -534,6 +545,48 @@
+  */
+ bool AutostartVisualReplay(const std::string& replayFile);
+ 
++// Pick the UI language from the OS unless the user set one explicitly.
++static void AutoDetectLocale()
++{
++	int numLocales = 0;
++	SDL_Locale** preferred = SDL_GetPreferredLocales(&numLocales);
++	if (preferred && numLocales > 0 && preferred[0]->language)
++	{
++		const std::string configuredLocale = g_ConfigDB.Get("locale", std::string{});
++		if (configuredLocale.empty())
++		{
++			std::string lang = preferred[0]->language;
++			const std::string country = preferred[0]->country ? preferred[0]->country : "";
++			std::string script;
++			const size_t dash = lang.find('-');
++			if (dash != std::string::npos)
++			{
++				script = lang.substr(dash + 1);
++				lang = lang.substr(0, dash);
++			}
++			std::string code;
++			if (lang == "zh")
++			{
++				const bool traditional = (script == "Hant") ||
++					country == "TW" || country == "HK" || country == "MO";
++				code = traditional ? "zh_TW" : "zh";
++			}
++			else if (lang == "pt")
++				code = (country == "BR") ? "pt_BR" : "pt_PT";
++			else if (lang == "en")
++				code = (country == "GB") ? "en_GB" : "en";
++			else
++				code = lang;
++			if (!code.empty() && code != "en")
++			{
++				g_ConfigDB.SetValueString(CFG_USER, "locale", code);
++				LOGMESSAGE("Auto-selected UI locale '%s' from system language", code.c_str());
++			}
++		}
++	}
++	SDL_free(preferred);
++}
++
+ bool Init(const CmdLineArgs& args, int flags)
+ {
+ 	new CProfileViewer;
+@@ -611,11 +664,25 @@
+ 
+ 	CNetHost::Initialize();
+ 
++#if OS_HARMONYOS
++	// On HarmonyOS the only OpenAL backend is the SDL3 audio driver, which
++	// needs SDL initialised before the sound manager opens its device. The
++	// regular SDL init happens later in InitGraphics(); non-visual mode needs
++	// neither video nor audio.
++	if (!args.Has("autostart-nonvisual"))
++	{
++		if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0)
++			LOGWARNING("Early SDL video/audio initialization failed: %s", SDL_GetError());
++	}
++#endif
++
+ #if CONFIG2_AUDIO
+ 	if (!args.Has("autostart-nonvisual") && !g_DisableAudio)
+ 		ISoundManager::CreateSoundManager();
+ #endif
+ 
++	AutoDetectLocale();
++
+ 	new L10n;
+ 
+ 	// Optionally start profiler HTTP output automatically
+@@ -634,6 +701,75 @@
+ 	return true;
+ }
+ 
++#if OS_HARMONYOS
++// Pick a comfortable default UI scale from the physical display size, so the
++// interface (buttons, text, minimap) isn't tiny on high-resolution screens.
++// Only runs while the scale is still at the default (1.0); once the player
++// changes it in the options, that choice is kept.
++static void AutoScaleUI()
++{
++	// One-time platform defaults (guarded so later user choices are kept).
++	const bool defaultsApplied = g_ConfigDB.Get("harmony.defaults.applied", false);
++	if (!defaultsApplied)
++	{
++		// Tear-free, stutter-free presentation. With vsync off the Vulkan
++		// swapchain uses IMMEDIATE present and the frame rate swings with the
++		// GPU load, which makes walk animations stutter and appear to slide.
++		if (!g_ConfigDB.Get("vsync", false))
++			g_ConfigDB.SetValueString(CFG_USER, "vsync", "true");
++		g_ConfigDB.SetValueString(CFG_USER, "harmony.defaults.applied", "true");
++	}
++
++	const float cur = g_ConfigDB.Get("gui.scale", 1.0f);
++	if (cur != 1.0f)
++		return;
++
++	// Physical desktop size captured by g_VideoMode during InitSDL. This is
++	// reliable on HarmonyOS regardless of display-ID wiring; fall back to the
++	// SDL display bounds if it is somehow unavailable.
++	int screenW = g_VideoMode.GetDesktopXRes();
++	int screenH = g_VideoMode.GetDesktopYRes();
++	if (screenW <= 0)
++	{
++		int nDisplays = 0;
++		SDL_DisplayID* displayIDs = SDL_GetDisplays(&nDisplays);
++		if (displayIDs && nDisplays > 0)
++		{
++			SDL_Rect bounds;
++			if (SDL_GetDisplayBounds(displayIDs[0], &bounds) == 0)
++			{
++				screenW = bounds.w;
++				screenH = bounds.h;
++			}
++		}
++		SDL_free(displayIDs);
++	}
++
++	if (screenW > 0)
++	{
++		float scale = screenW / 1920.0f;
++		if (scale < 1.0f) scale = 1.0f;
++		if (scale > 2.0f) scale = 2.0f;
++		scale = SDL_roundf(scale * 4.0f) / 4.0f;  // snap to 0.25 steps
++		if (scale > 1.0f)
++		{
++			g_ConfigDB.SetValueString(CFG_USER, "gui.scale", std::to_string(scale));
++			// ReadConfig already ran, so apply now rather than waiting for next launch.
++			g_VideoMode.Rescale(scale);
++			LOGMESSAGE("Auto-selected GUI scale %.2f for display %dx%d", scale, screenW, screenH);
++		}
++	}
++}
++#endif
++
++#if OS_HARMONYOS
++static void OH_GSTrace(const char* tag)
++{
++	FILE* f = fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt", "a");
++	if (f) { fprintf(f, "%s\n", tag); fclose(f); }
++}
++#endif
++
+ void InitGraphics(const CmdLineArgs& args, int flags, const std::vector<CStr>& installedMods,
+ 	ScriptContext& scriptContext, ScriptInterface& scriptInterface)
+ {
+@@ -647,7 +783,10 @@
+ 			throw PSERROR_System_VmodeFailed(); // abort startup
+ 	}
+ 
++	OH_GSTrace("gs after-initsdl");
++	OH_GSTrace("gs before-hwdet");
+ 	RunHardwareDetection(!g_Quickstart, g_VideoMode.GetBackendDevice());
++	OH_GSTrace("gs after-hwdet");
+ 
+ 	// Optionally start profiler GPU timings automatically
+ 	// (By default it's only enabled by a hotkey, for performance/compatibility)
+@@ -657,7 +796,13 @@
+ 	if(g_DisableAudio)
+ 		ISoundManager::SetEnabled(false);
+ 
++#if OS_HARMONYOS
++	AutoScaleUI();
++#endif
++
++	OH_GSTrace("gs before-gui");
+ 	g_GUI = new CGUIManager{scriptContext, scriptInterface};
++	OH_GSTrace("gs after-gui");
+ 
+ 
+ 	if (RenderPathEnum::FromString(g_ConfigDB.Get("renderpath", "default"s)) == FIXED)
+@@ -674,10 +819,13 @@
+ 
+ 	g_RenderingOptions.ReadConfigAndSetupHooks();
+ 
++	OH_GSTrace("gs before-renderer");
+ 	// create renderer
+ 	new CRenderer(g_VideoMode.GetBackendDevice());
++	OH_GSTrace("gs after-renderer");
+ 
+ 	InitInput();
++	OH_GSTrace("gs after-initinput");
+ 
+ 	// TODO: Is this the best place for this?
+ 	if (VfsDirectoryExists(L"maps/"))
+@@ -872,6 +1020,17 @@
+ 		LDR_NonprogressiveLoad();
+ 		g_Game->ReallyStartGame();
+ 	}
++
++#if OS_HARMONYOS
++	// The first window was created in windowed mode; now that the renderer and
++	// GUI are fully initialised, switch to fullscreen if configured. Doing it
++	// here rather than during SDL_CreateWindow avoids racing the PC maximize
++	// transition against EGL surface creation (which crashed the GL backend).
++	if (!g_ConfigDB.Get("windowed", true) && !g_VideoMode.IsInFullscreen())
++	{
++		g_VideoMode.SetFullscreen(true);
++	}
++#endif
+ 
+ 	return true;
+ }
+diff -ruN --text a/source/ps/GameSetup/HWDetect.cpp b/source/ps/GameSetup/HWDetect.cpp
+--- a/source/ps/GameSetup/HWDetect.cpp	2025-12-22 11:24:49
++++ b/source/ps/GameSetup/HWDetect.cpp	2026-09-26 22:16:34
+@@ -23,7 +23,9 @@
+ #include "lib/debug.h"
+ #include "lib/external_libraries/curl.h"
+ #include "lib/external_libraries/enet.h"
++#if CONFIG2_LOBBY
+ #include "lib/external_libraries/gloox.h"
++#endif
+ #include "lib/external_libraries/png.h"
+ #include "lib/external_libraries/libsdl.h"
+ #include "lib/path.h"
+@@ -149,24 +151,26 @@
+ {
+ 	LibraryReporter reporter{rq, "sdl"};
+ 
+-	SDL_version build, runtime;
+-	SDL_VERSION(&build);
++	const int sdlVersion = SDL_GetVersion();
+ 
+ 	char version[16];
+-	snprintf(version, ARRAY_SIZE(version), "%d.%d.%d", build.major, build.minor, build.patch);
++	snprintf(version, ARRAY_SIZE(version), "%d.%d.%d",
++		SDL_VERSIONNUM_MAJOR(sdlVersion),
++		SDL_VERSIONNUM_MINOR(sdlVersion),
++		SDL_VERSIONNUM_MICRO(sdlVersion));
+ 	reporter.Add("build_version", version);
+-
+-	SDL_GetVersion(&runtime);
+-	snprintf(version, ARRAY_SIZE(version), "%d.%d.%d", runtime.major, runtime.minor, runtime.patch);
+ 	reporter.Add("runtime_version", version);
+ 
+ 	// This is null in atlas (and further the call triggers an assertion).
+ 	const char* backend = g_VideoMode.GetWindow() ? GetSDLSubsystem(g_VideoMode.GetWindow()) : "none";
+ 	reporter.Add("video_backend", backend ? backend : "unknown");
+ 
+-	reporter.Add("display_count", SDL_GetNumVideoDisplays());
++	int displayCount = 0;
++	SDL_DisplayID* displays = SDL_GetDisplays(&displayCount);
++	reporter.Add("display_count", displayCount);
++	SDL_free(displays);
+ 
+-	reporter.Add("cpu_count", SDL_GetCPUCount());
++	reporter.Add("cpu_count", SDL_GetNumLogicalCPUCores());
+ 	reporter.Add("system_ram", SDL_GetSystemRAM());
+ 
+ 	return reporter.MakeReport();
+@@ -209,7 +213,9 @@
+ 	appendLibrary(LibraryReporter{rq, "boost"}.Add("version", BOOST_VERSION).MakeReport());
+ 	appendLibrary(LibraryReporter{rq, "enet"}.Add("version", std::to_string(ENET_VERSION)).MakeReport());
+ 	appendLibrary(LibraryReporter{rq, "fmt"}.Add("version", FMT_VERSION).MakeReport());
++#if CONFIG2_LOBBY
+ 	appendLibrary(LibraryReporter{rq, "gloox"}.Add("version", gloox_version()).MakeReport());
++#endif
+ 	appendLibrary(LibraryReporter{rq, "libicu"}.Add("version", U_ICU_VERSION).MakeReport());
+ 	appendLibrary(LibraryReporter{rq, "libcurl"}.Add("version", std::string(curl_version())).MakeReport());
+ #if CONFIG2_AUDIO
+@@ -321,13 +327,26 @@
+ 	g_DisableAudio = disabled;
+ }
+ 
++#if OS_HARMONYOS
++static void OH_HWTrace(const char* tag)
++{
++	FILE* f = fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt", "a");
++	if (f) { fprintf(f, "%s\n", tag); fclose(f); }
++}
++#endif
++
+ void RunHardwareDetection(bool writeSystemInfoBeforeDetection, Renderer::Backend::IDevice* device)
+ {
+ 	utsname un;
+ 	uname(&un);
+ 
++	OH_HWTrace("hw start");
+ 	if (writeSystemInfoBeforeDetection)
++	{
++		OH_HWTrace("hw before-writesysinfo");
+ 		WriteSystemInfo(device, un);
++		OH_HWTrace("hw after-writesysinfo");
++	}
+ 
+ 	PROFILE2("RunHardwareDetection");
+ 
+@@ -352,6 +371,7 @@
+ 
+ 	std::string code = file.DecodeUTF8(); // assume it's UTF-8
+ 	scriptInterface.LoadScript(scriptName, code);
++	OH_HWTrace("hw after-loadscript");
+ 
+ 	// Collect all the settings we'll pass to the script:
+ 	// (We'll use this same data for the opt-in online reporting system, so it
+@@ -403,7 +423,9 @@
+ 	JS::RootedValue backendDeviceSettings(rq.cx);
+ 	Script::CreateObject(rq, &backendDeviceSettings);
+ 
++	OH_HWTrace("hw before-device-report");
+ 	device->Report(rq, backendDeviceSettings);
++	OH_HWTrace("hw after-device-report");
+ 	Script::SetProperty(rq, settings, "renderer_backend", backendDeviceSettings);
+ 
+ 	Script::SetProperty(rq, settings, "video_desktop_xres", g_VideoMode.GetDesktopXRes());
+@@ -462,14 +484,17 @@
+ 	// The version should be increased for every meaningful change.
+ 	const int reportVersion = 23;
+ 
+-	// Send the same data to the reporting system
++	OH_HWTrace("hw before-submitreport");
+ 	g_UserReporter.SubmitReport(
+ 		"hwdetect",
+ 		reportVersion,
+ 		Script::StringifyJSON(rq, &settings, false),
+ 		Script::StringifyJSON(rq, &settings, true));
++	OH_HWTrace("hw after-submitreport");
+ 
+ 	// Run the detection script:
+ 	JS::RootedValue global(rq.cx, rq.globalValue());
++	OH_HWTrace("hw before-jsrun");
+ 	ScriptFunction::CallVoid(rq, global, "RunHardwareDetection", settings);
++	OH_HWTrace("hw after-jsrun");
+ }
+diff -ruN --text a/source/ps/GameSetup/Paths.cpp b/source/ps/GameSetup/Paths.cpp
+--- a/source/ps/GameSetup/Paths.cpp	2025-12-22 11:24:49
++++ b/source/ps/GameSetup/Paths.cpp	2026-09-26 16:13:12
+@@ -74,6 +74,19 @@
+ 		m_cache = appdata/"cache"/"";
+ 		m_logs = appdata/"logs"/"";
+ 
++#elif OS_HARMONYOS
++
++	// App sandbox: context.filesDir as seen inside the process. All game + user
++	// data lives under an "0ad" subdirectory (pushed to the device via hdc).
++	const OsPath appdata = OsPath("/data/storage/el2/base/haps/entry/files/0ad");
++
++	// No game vs. user data distinction here
++	m_gameData = appdata/"data"/"";
++	m_userData = m_gameData;
++	m_config = appdata/"config"/"";
++	m_cache = appdata/"cache"/"";
++	m_logs = appdata/"logs"/"";
++
+ #elif OS_WIN
+ 
+ 		/* For reasoning behind our Windows paths, see the discussion here:
+@@ -170,6 +183,8 @@
+ {
+ #if OS_ANDROID
+ 	return OsPath("/sdcard/0ad"); // TODO: this is kind of bogus
++#elif OS_HARMONYOS
++	return OsPath("/data/storage/el2/base/haps/entry/files/0ad");
+ #else
+ 
+ 	// get full path to executable
+diff -ruN --text a/source/ps/Globals.cpp b/source/ps/Globals.cpp
+--- a/source/ps/Globals.cpp	2025-12-22 11:24:49
++++ b/source/ps/Globals.cpp	2026-09-26 15:36:17
+@@ -46,41 +46,36 @@
+ 
+ 	switch(ev->ev.type)
+ 	{
+-	case SDL_WINDOWEVENT:
+-		switch(ev->ev.window.event)
+-		{
+-		case SDL_WINDOWEVENT_MINIMIZED:
+-			g_app_minimized = true;
+-			break;
+-		case SDL_WINDOWEVENT_EXPOSED:
+-		case SDL_WINDOWEVENT_RESTORED:
+-			g_app_minimized = false;
+-			break;
+-		case SDL_WINDOWEVENT_FOCUS_GAINED:
+-			g_app_has_focus = true;
+-			break;
+-		case SDL_WINDOWEVENT_FOCUS_LOST:
+-			g_app_has_focus = false;
+-			break;
+-		case SDL_WINDOWEVENT_ENTER:
+-			g_mouse_active = true;
+-			break;
+-		case SDL_WINDOWEVENT_LEAVE:
+-			g_mouse_active = false;
+-			break;
+-		}
++	case SDL_EVENT_WINDOW_MINIMIZED:
++		g_app_minimized = true;
+ 		return IN_PASS;
++	case SDL_EVENT_WINDOW_EXPOSED:
++	case SDL_EVENT_WINDOW_RESTORED:
++		g_app_minimized = false;
++		return IN_PASS;
++	case SDL_EVENT_WINDOW_FOCUS_GAINED:
++		g_app_has_focus = true;
++		return IN_PASS;
++	case SDL_EVENT_WINDOW_FOCUS_LOST:
++		g_app_has_focus = false;
++		return IN_PASS;
++	case SDL_EVENT_WINDOW_MOUSE_ENTER:
++		g_mouse_active = true;
++		return IN_PASS;
++	case SDL_EVENT_WINDOW_MOUSE_LEAVE:
++		g_mouse_active = false;
++		return IN_PASS;
+ 
+-	case SDL_MOUSEMOTION:
++	case SDL_EVENT_MOUSE_MOTION:
+ 		g_mouse_x = ev->ev.motion.x;
+ 		g_mouse_y = ev->ev.motion.y;
+ 		return IN_PASS;
+ 
+-	case SDL_MOUSEBUTTONDOWN:
+-	case SDL_MOUSEBUTTONUP:
++	case SDL_EVENT_MOUSE_BUTTON_DOWN:
++	case SDL_EVENT_MOUSE_BUTTON_UP:
+ 		c = ev->ev.button.button;
+ 		if(c < ARRAY_SIZE(g_mouse_buttons))
+-			g_mouse_buttons[c] = (ev->ev.type == SDL_MOUSEBUTTONDOWN);
++			g_mouse_buttons[c] = (ev->ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+ 		else
+ 		{
+ 			// don't complain: just ignore people with too many mouse buttons
+@@ -88,9 +83,9 @@
+ 		}
+ 		return IN_PASS;
+ 
+-	case SDL_KEYDOWN:
+-	case SDL_KEYUP:
+-		g_scancodes[ev->ev.key.keysym.scancode] = (ev->ev.type == SDL_KEYDOWN);
++	case SDL_EVENT_KEY_DOWN:
++	case SDL_EVENT_KEY_UP:
++		g_scancodes[ev->ev.key.scancode] = (ev->ev.type == SDL_EVENT_KEY_DOWN);
+ 		return IN_PASS;
+ 
+ 	default:
+diff -ruN --text a/source/ps/Hotkey.cpp b/source/ps/Hotkey.cpp
+--- a/source/ps/Hotkey.cpp	2025-12-22 11:24:50
++++ b/source/ps/Hotkey.cpp	2026-09-26 15:27:13
+@@ -83,7 +83,7 @@
+ }
+ 
+ static_assert(std::is_integral<std::underlying_type<SDL_Scancode>::type>::value, "SDL_Scancode is not an integral enum.");
+-static_assert(SDL_USEREVENT_ == SDL_USEREVENT, "SDL_USEREVENT_ is not the same type as the real SDL_USEREVENT");
++static_assert(SDL_USEREVENT_ == SDL_EVENT_USER, "SDL_USEREVENT_ is not the same type as the real SDL_EVENT_USER");
+ 
+ // Look up each key binding in the config file and set the mappings for
+ // all key combinations that trigger it.
+@@ -167,7 +167,7 @@
+ 	else if ((int)key.code < MOUSE_LAST && (int)key.code > MOUSE_BASE)
+ 		return g_mouse_buttons[key.code - MOUSE_BASE];
+ 	// Modifier keycodes are between the normal keys and the mouse 'keys'
+-	else if ((int)key.code < UNIFIED_LAST && (int)key.code > SDL_NUM_SCANCODES)
++	else if ((int)key.code < UNIFIED_LAST && (int)key.code > SDL_SCANCODE_COUNT)
+ 		return unified[key.code - UNIFIED_SHIFT];
+ 	// This codepath shouldn't be taken, but not having it triggers warnings.
+ 	else
+@@ -193,13 +193,13 @@
+ 
+ 	switch(ev->ev.type)
+ 	{
+-	case SDL_KEYDOWN:
+-	case SDL_KEYUP:
+-		scancode = ev->ev.key.keysym.scancode;
++	case SDL_EVENT_KEY_DOWN:
++	case SDL_EVENT_KEY_UP:
++		scancode = ev->ev.key.scancode;
+ 		break;
+ 
+-	case SDL_MOUSEBUTTONDOWN:
+-	case SDL_MOUSEBUTTONUP:
++	case SDL_EVENT_MOUSE_BUTTON_DOWN:
++	case SDL_EVENT_MOUSE_BUTTON_UP:
+ 		// Mousewheel events are no longer buttons, but we want to maintain the order
+ 		// expected by g_mouse_buttons for compatibility
+ 		if (ev->ev.button.button >= SDL_BUTTON_X1)
+@@ -208,7 +208,7 @@
+ 			scancode = MOUSE_BASE + (int)ev->ev.button.button;
+ 		break;
+ 
+-	case SDL_MOUSEWHEEL:
++	case SDL_EVENT_MOUSE_WHEEL:
+ 		if (ev->ev.wheel.y > 0)
+ 		{
+ 			scancode = MOUSE_WHEELUP;
+@@ -241,32 +241,32 @@
+ 	// Just send them to this handler; don't let the imaginary event codes leak back to real SDL.
+ 
+ 	SDL_Event_ phantom;
+-	phantom.ev.type = ((ev->ev.type == SDL_KEYDOWN) || (ev->ev.type == SDL_MOUSEBUTTONDOWN)) ? SDL_KEYDOWN : SDL_KEYUP;
+-	if (phantom.ev.type == SDL_KEYDOWN)
+-		phantom.ev.key.repeat = ev->ev.type == SDL_KEYDOWN ? ev->ev.key.repeat : 0;
++	phantom.ev.type = ((ev->ev.type == SDL_EVENT_KEY_DOWN) || (ev->ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN)) ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
++	if (phantom.ev.type == SDL_EVENT_KEY_DOWN)
++		phantom.ev.key.repeat = ev->ev.type == SDL_EVENT_KEY_DOWN ? ev->ev.key.repeat : 0;
+ 
+ 	if (scancode == SDL_SCANCODE_LSHIFT || scancode == SDL_SCANCODE_RSHIFT)
+ 	{
+-		phantom.ev.key.keysym.scancode = static_cast<SDL_Scancode>(UNIFIED_SHIFT);
+-		unified[0] = (phantom.ev.type == SDL_KEYDOWN);
++		phantom.ev.key.scancode = static_cast<SDL_Scancode>(UNIFIED_SHIFT);
++		unified[0] = (phantom.ev.type == SDL_EVENT_KEY_DOWN);
+ 		return HotkeyInputPrepHandler(&phantom);
+ 	}
+ 	else if (scancode == SDL_SCANCODE_LCTRL || scancode == SDL_SCANCODE_RCTRL)
+ 	{
+-		phantom.ev.key.keysym.scancode = static_cast<SDL_Scancode>(UNIFIED_CTRL);
+-		unified[1] = (phantom.ev.type == SDL_KEYDOWN);
++		phantom.ev.key.scancode = static_cast<SDL_Scancode>(UNIFIED_CTRL);
++		unified[1] = (phantom.ev.type == SDL_EVENT_KEY_DOWN);
+ 		return HotkeyInputPrepHandler(&phantom);
+ 	}
+ 	else if (scancode == SDL_SCANCODE_LALT || scancode == SDL_SCANCODE_RALT)
+ 	{
+-		phantom.ev.key.keysym.scancode = static_cast<SDL_Scancode>(UNIFIED_ALT);
+-		unified[2] = (phantom.ev.type == SDL_KEYDOWN);
++		phantom.ev.key.scancode = static_cast<SDL_Scancode>(UNIFIED_ALT);
++		unified[2] = (phantom.ev.type == SDL_EVENT_KEY_DOWN);
+ 		return HotkeyInputPrepHandler(&phantom);
+ 	}
+ 	else if (scancode == SDL_SCANCODE_LGUI || scancode == SDL_SCANCODE_RGUI)
+ 	{
+-		phantom.ev.key.keysym.scancode = static_cast<SDL_Scancode>(UNIFIED_SUPER);
+-		unified[3] = (phantom.ev.type == SDL_KEYDOWN);
++		phantom.ev.key.scancode = static_cast<SDL_Scancode>(UNIFIED_SUPER);
++		unified[3] = (phantom.ev.type == SDL_EVENT_KEY_DOWN);
+ 		return HotkeyInputPrepHandler(&phantom);
+ 	}
+ 
+@@ -299,9 +299,9 @@
+ 	 * ...Yes, this is all surprisingly complex.
+ 	 */
+ 
+-	bool isReleasedKey = ev->ev.type == SDL_KEYUP || ev->ev.type == SDL_MOUSEBUTTONUP;
++	bool isReleasedKey = ev->ev.type == SDL_EVENT_KEY_UP || ev->ev.type == SDL_EVENT_MOUSE_BUTTON_UP;
+ 	// Wheel events are pressed & released in the same go.
+-	bool isInstantaneous = ev->ev.type == SDL_MOUSEWHEEL;
++	bool isInstantaneous = ev->ev.type == SDL_EVENT_MOUSE_WHEEL;
+ 
+ 	if (!isInstantaneous)
+ 	{
+@@ -364,7 +364,7 @@
+ 	if (!currentEvent)
+ 		return IN_PASS;
+ 
+-	bool isInstantaneous = ev->ev.type == SDL_MOUSEWHEEL;
++	bool isInstantaneous = ev->ev.type == SDL_EVENT_MOUSE_WHEEL;
+ 
+ 	// TODO: it's probably possible to break hotkeys somewhat if the "Up" event that would release a hotkey is handled
+ 	// by a priori handler - it might be safer to do that in the 'Prep' phase.
+@@ -424,7 +424,7 @@
+ 	for (const PressedHotkey& hotkey : isInstantaneous ? newPressedHotkeys : pressedHotkeys)
+ 	{
+ 		// Send a KeyPress event when a hotkey is pressed initially and on mouseButton and mouseWheel events.
+-		if (ev->ev.type != SDL_KEYDOWN || ev->ev.key.repeat == 0)
++		if (ev->ev.type != SDL_EVENT_KEY_DOWN || ev->ev.key.repeat == 0)
+ 		{
+ 			SDL_Event_ hotkeyPressNotification;
+ 			hotkeyPressNotification.ev.type = hotkey.retriggered ? SDL_HOTKEYPRESS_SILENT : SDL_HOTKEYPRESS;
+diff -ruN --text a/source/ps/Hotkey.h b/source/ps/Hotkey.h
+--- a/source/ps/Hotkey.h	2025-12-22 11:24:50
++++ b/source/ps/Hotkey.h	2026-09-26 15:25:01
+@@ -44,7 +44,7 @@
+ // SDL_Scancode is an enum, we'll use an explicit int to avoid including SDL in this header.
+ using SDL_Scancode_ = int;
+ 
+-// 0x8000 is SDL_USEREVENT, this is static_asserted in Hotkey.cpp
++// 0x8000 is SDL_EVENT_USER, this is static_asserted in Hotkey.cpp
+ // We do this to avoid including SDL in this header.
+ const uint SDL_USEREVENT_ = 0x8000;
+ const uint SDL_HOTKEYPRESS = SDL_USEREVENT_;
+diff -ruN --text a/source/ps/Joystick.cpp b/source/ps/Joystick.cpp
+--- a/source/ps/Joystick.cpp	2025-12-22 11:24:50
++++ b/source/ps/Joystick.cpp	2026-09-26 15:36:17
+@@ -48,32 +48,35 @@
+ 		return;
+ 	}
+ 
+-	int numJoysticks = SDL_NumJoysticks();
++	int numJoysticks = 0;
++	SDL_JoystickID* joystickIDs = SDL_GetJoysticks(&numJoysticks);
+ 
+ 	LOGMESSAGE("Found %d joystick(s)", numJoysticks);
+ 
+ 	for (int i = 0; i < numJoysticks; ++i)
+ 	{
+-		SDL_Joystick* stick = SDL_JoystickOpen(i);
++		SDL_Joystick* stick = SDL_OpenJoystick(joystickIDs[i]);
+ 		if (!stick)
+ 		{
+ 			LOGERROR("CJoystick::Initialise failed to open joystick %d (\"%s\")", i, SDL_GetError());
+ 			continue;
+ 		}
+-		const char* name = SDL_JoystickName(stick);
++		const char* name = SDL_GetJoystickName(stick);
+ 		LOGMESSAGE("Joystick %d: %s", i, name);
+-		SDL_JoystickClose(stick);
++		SDL_CloseJoystick(stick);
+ 	}
+ 
+ 	if (numJoysticks)
+ 	{
+-		SDL_JoystickEventState(SDL_ENABLE);
++		SDL_SetJoystickEventsEnabled(true);
+ 
+ 		// Always pick the first joystick, and assume that's the right one
+-		m_Joystick = SDL_JoystickOpen(0);
++		m_Joystick = SDL_OpenJoystick(joystickIDs[0]);
+ 		if (!m_Joystick)
+ 			LOGERROR("CJoystick::Initialise failed to open joystick (\"%s\")", SDL_GetError());
+ 	}
++
++	SDL_free(joystickIDs);
+ }
+ 
+ bool CJoystick::IsEnabled()
+@@ -83,10 +86,10 @@
+ 
+ float CJoystick::GetAxisValue(int axis)
+ {
+-	if (!m_Joystick || axis < 0 || axis >= SDL_JoystickNumAxes(m_Joystick))
++	if (!m_Joystick || axis < 0 || axis >= SDL_GetNumJoystickAxes(m_Joystick))
+ 		return 0.f;
+ 
+-	int16_t val = SDL_JoystickGetAxis(m_Joystick, axis);
++	int16_t val = SDL_GetJoystickAxis(m_Joystick, axis);
+ 
+ 	// Normalize values into the range [-1, +1] excluding the deadzone around 0
+ 	float norm;
+diff -ruN --text a/source/ps/KeyName.cpp b/source/ps/KeyName.cpp
+--- a/source/ps/KeyName.cpp	2025-12-22 11:24:50
++++ b/source/ps/KeyName.cpp	2026-09-26 15:37:05
+@@ -137,9 +137,9 @@
+ 	{ SDLK_PLUS, "Plus" },
+ 	{ SDLK_MINUS, "Minus" },
+ 
+-	{ SDLK_QUOTE, "SingleQuote" },
+-	{ SDLK_QUOTEDBL, "DoubleQuote" },
+-	{ SDLK_BACKQUOTE, "BackQuote" },
++	{ SDLK_APOSTROPHE, "SingleQuote" },
++	{ SDLK_DBLAPOSTROPHE, "DoubleQuote" },
++	{ SDLK_GRAVE, "BackQuote" },
+ 
+ 	{ SDLK_LEFTPAREN, { "LeftParen" } },
+ 
+@@ -198,7 +198,7 @@
+ 	else if (static_cast<int>(scancode) == MOUSE_X2)
+ 		return "WheelRight";
+ 
+-	SDL_Keycode code = SDL_GetKeyFromScancode(scancode);
++	SDL_Keycode code = SDL_GetKeyFromScancode(scancode, SDL_KMOD_NONE, false);
+ 
+ 	if (keyNames.find(code) != keyNames.end())
+ 		return keyNames.at(code);
+diff -ruN --text a/source/ps/KeyName.h b/source/ps/KeyName.h
+--- a/source/ps/KeyName.h	2025-12-22 11:24:50
++++ b/source/ps/KeyName.h	2026-09-26 15:25:01
+@@ -32,7 +32,7 @@
+ enum {
+ 	// Start sequential IDs in the right place
+ 	// Pick a code which is greater than any scancodes used by SDL itself
+-	EXTRA_KEYS_BASE = SDL_NUM_SCANCODES,
++	EXTRA_KEYS_BASE = SDL_SCANCODE_COUNT,
+ 	// 'Keycodes' for the unified modifier keys
+ 	UNIFIED_SHIFT,
+ 	UNIFIED_CTRL,
+diff -ruN --text a/source/ps/ModIo.cpp b/source/ps/ModIo.cpp
+--- a/source/ps/ModIo.cpp	2025-12-22 11:24:50
++++ b/source/ps/ModIo.cpp	2026-09-27 09:37:25
+@@ -123,6 +123,15 @@
+ 	m_Curl = curl_easy_init();
+ 	ENSURE(m_Curl);
+ 
++#if OS_HARMONYOS
++	// The device has no OpenSSL-visible system CA store; use the CA bundle the
++	// bootstrap writes into the config dir.
++	curl_easy_setopt(m_Curl, CURLOPT_CAINFO,
++		"/data/storage/el2/base/haps/entry/files/0ad/config/cacert.pem");
++	curl_easy_setopt(m_Curl, CURLOPT_SSL_VERIFYPEER, 1L);
++	curl_easy_setopt(m_Curl, CURLOPT_SSL_VERIFYHOST, 2L);
++#endif
++
+ 	// Capture error messages
+ 	curl_easy_setopt(m_Curl, CURLOPT_ERRORBUFFER, m_ErrorBuffer);
+ 
+diff -ruN --text a/source/ps/ProfileViewer.cpp b/source/ps/ProfileViewer.cpp
+--- a/source/ps/ProfileViewer.cpp	2026-01-05 11:10:32
++++ b/source/ps/ProfileViewer.cpp	2026-09-26 15:27:13
+@@ -275,12 +275,12 @@
+ {
+ 	switch(ev->ev.type)
+ 	{
+-	case SDL_KEYDOWN:
++	case SDL_EVENT_KEY_DOWN:
+ 	{
+ 		if (!m->profileVisible)
+ 			break;
+ 
+-		int k = ev->ev.key.keysym.sym;
++		int k = ev->ev.key.key;
+ 		if (k >= SDLK_0 && k <= SDLK_9)
+ 		{
+ 			m->NavigateTree(k - SDLK_0);
+diff -ruN --text a/source/ps/TouchInput.cpp b/source/ps/TouchInput.cpp
+--- a/source/ps/TouchInput.cpp	2025-12-22 11:24:50
++++ b/source/ps/TouchInput.cpp	2026-09-27 14:19:06
+@@ -27,31 +27,32 @@
+ #include "lib/timer.h"
+ #include "maths/Matrix3D.h"
+ #include "ps/Game.h"
++#include "ps/VideoMode.h"
+ 
+ #include <SDL_events.h>
++#include <SDL_log.h>
+ #include <SDL_mouse.h>
++#include <SDL_video.h>
++#include <cmath>
+ #include <cinttypes>
+ 
+-// When emulation is enabled:
+-// Left-click to put finger 0 down.
+-// Then left-click-and-drag to move finger 0.
+-// Then left-click to put finger 0 up.
+-// Same with right-click for finger 1.
+-#define EMULATE_FINGERS_WITH_MOUSE 0
+-
+ extern int g_xres, g_yres;
+ 
+-// NOTE: All this code is currently just a basic prototype for testing;
+-// it might need significant redesigning for proper usage.
+-
+-CTouchInput::CTouchInput() :
+-	m_State(STATE_INACTIVE)
++namespace
+ {
+-	for (size_t i = 0; i < MAX_FINGERS; ++i)
+-		m_Down[i] = false;
++// Finger movement (px) beyond which a one-finger gesture becomes a band-box
++// selection rather than a tap.
++constexpr float BOX_THRESHOLD = 14.0f;
++// Hold time (s) for a stationary one-finger gesture to become a right click.
++constexpr double LONG_PRESS_TIME = 0.45;
++// Pinch distance (px) to world-metres scaling.
++constexpr float PINCH_ZOOM_FACTOR = 0.005f;
++} // namespace
+ 
+-	for (size_t i = 0; i < MAX_MOUSE; ++i)
+-		m_MouseEmulateState[i] = MOUSE_INACTIVE;
++CTouchInput::CTouchInput()
++	: m_OneMode(ONE_IDLE), m_CameraGesture(false),
++	  m_DownTime(0.0), m_PanDist(0.0f)
++{
+ }
+ 
+ CTouchInput::~CTouchInput()
+@@ -60,228 +61,316 @@
+ 
+ bool CTouchInput::IsEnabled()
+ {
+-#if OS_ANDROID || EMULATE_FINGERS_WITH_MOUSE
++#if OS_ANDROID || OS_HARMONYOS
+ 	return true;
+ #else
+ 	return false;
+ #endif
+ }
+ 
+-void CTouchInput::OnFingerDown(int id, int x, int y)
++bool CTouchInput::IsCameraGestureActive() const
+ {
+-	debug_printf("finger down %d %d %d; state %d\n", id, x, y, m_State);
+-	m_Down[id] = true;
+-	m_Prev[id] = m_Pos[id] = CVector2D(x, y);
++	return m_CameraGesture;
++}
+ 
+-	if (m_State == STATE_INACTIVE && id == 0)
+-	{
+-		m_State = STATE_FIRST_TOUCH;
+-		m_FirstTouchTime = timer_Time();
+-		m_FirstTouchPos = CVector2D(x, y);
+-	}
+-	else if ((m_State == STATE_FIRST_TOUCH || m_State == STATE_PANNING) && id == 1)
+-	{
+-		m_State = STATE_ZOOMING;
+-	}
++int CTouchInput::FindFreeSlot() const
++{
++	for (size_t i = 0; i < MAX_FINGERS; ++i)
++		if (!m_Slot[i].down)
++			return static_cast<int>(i);
++	return -1;
+ }
+ 
+-void CTouchInput::OnFingerUp(int id, int x, int y)
++int CTouchInput::FindSlot(long long fingerId) const
+ {
+-	debug_printf("finger up %d %d %d; state %d\n", id, x, y, m_State);
+-	m_Down[id] = false;
+-	m_Pos[id] = CVector2D(x, y);
++	for (size_t i = 0; i < MAX_FINGERS; ++i)
++		if (m_Slot[i].down && m_Slot[i].fingerId == fingerId)
++			return static_cast<int>(i);
++	return -1;
++}
+ 
+-	if (m_State == STATE_FIRST_TOUCH && id == 0 && timer_Time() < m_FirstTouchTime + 0.5)
+-	{
+-		m_State = STATE_INACTIVE;
++int CTouchInput::ActiveCount() const
++{
++	int n = 0;
++	for (size_t i = 0; i < MAX_FINGERS; ++i)
++		if (m_Slot[i].down)
++			++n;
++	return n;
++}
+ 
+-		SDL_Event_ ev;
+-		ev.ev.button.button = SDL_BUTTON_LEFT;
+-		ev.ev.button.x = m_Pos[0].X;
+-		ev.ev.button.y = m_Pos[0].Y;
++bool CTouchInput::InGame() const
++{
++	return g_Game && g_Game->IsGameStarted() && g_Game->GetView();
++}
+ 
+-		ev.ev.type = SDL_MOUSEBUTTONDOWN;
+-		ev.ev.button.state = SDL_PRESSED;
+-		SDL_PushEvent(&ev.ev);
++void CTouchInput::PushButtonEvent(int button, bool down, int x, int y)
++{
++	SDL_Event_ ev{};
++	ev.ev.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
++	ev.ev.button.windowID = SDL_GetWindowID(g_VideoMode.GetWindow());
++	ev.ev.button.which = 0; // normal (non-touch) mouse id, avoids touch filtering
++	ev.ev.button.button = button;
++	ev.ev.button.down = down;
++	ev.ev.button.clicks = 1;
++	ev.ev.button.x = x;
++	ev.ev.button.y = y;
++	SDL_PushEvent(&ev.ev);
++}
+ 
+-		ev.ev.type = SDL_MOUSEBUTTONUP;
+-		ev.ev.button.state = SDL_RELEASED;
+-		SDL_PushEvent(&ev.ev);
+-	}
+-	else if (m_State == STATE_ZOOMING && id == 1)
+-	{
+- 		m_State = STATE_PANNING;
+-	}
+- 	else
+-	{
+-		m_State = STATE_INACTIVE;
+-	}
++void CTouchInput::PushMotionEvent(int x, int y)
++{
++	SDL_Event_ ev{};
++	ev.ev.type = SDL_EVENT_MOUSE_MOTION;
++	ev.ev.motion.windowID = SDL_GetWindowID(g_VideoMode.GetWindow());
++	ev.ev.motion.which = 0; // normal (non-touch) mouse id
++	ev.ev.motion.state = SDL_BUTTON_LMASK;
++	ev.ev.motion.x = x;
++	ev.ev.motion.y = y;
++	ev.ev.motion.xrel = 0;
++	ev.ev.motion.yrel = 0;
++	SDL_PushEvent(&ev.ev);
+ }
+ 
+-void CTouchInput::OnFingerMotion(int id, int x, int y)
++void CTouchInput::StartCameraGesture()
+ {
+-	debug_printf("finger motion %d %d %d; state %d\n", id, x, y, m_State);
++	const CCamera& cam = *(g_Game->GetView()->GetCamera());
++	const CVector2D c = (m_Slot[0].pos + m_Slot[1].pos) * 0.5;
++	m_PanFocus = cam.GetWorldCoordinates(c.X, c.Y, true);
++	m_PanDist = (m_PanFocus - cam.GetOrientation().GetTranslation()).Y;
++}
+ 
+-	CVector2D pos(x, y);
++void CTouchInput::UpdateCameraGesture()
++{
++	const CVector2D c0 = m_Slot[0].pos;
++	const CVector2D c1 = m_Slot[1].pos;
++	const CVector2D p0 = m_Slot[0].prev;
++	const CVector2D p1 = m_Slot[1].prev;
++	const CVector2D c = (c0 + c1) * 0.5;
++	const CVector2D pc = (p0 + p1) * 0.5;
++	const float pinch = (c0 - c1).Length();
++	const float prevPinch = (p0 - p1).Length();
+ 
+-	m_Prev[id] = m_Pos[id];
+-	m_Pos[id] = pos;
++	CCamera& cam = *(g_Game->GetView()->GetCamera());
+ 
+-	if (m_State == STATE_FIRST_TOUCH && id == 0)
++	// 1) Pan: grab the ground point that was under the centroid last frame and
++	//    pull it under the current centroid.
+ 	{
+-		if ((pos - m_FirstTouchPos).Length() > 16)
+-		{
+-			m_State = STATE_PANNING;
+-
+-			const CCamera& camera = *(g_Game->GetView()->GetCamera());
+-			m_PanFocus = camera.GetWorldCoordinates(m_FirstTouchPos.X, m_FirstTouchPos.Y, true);
+-			m_PanDist = (m_PanFocus - camera.GetOrientation().GetTranslation()).Y;
+-		}
++		const auto ray = cam.BuildCameraRay(c.X, c.Y);
++		CVector3D dir = ray.direction;
++		dir *= m_PanDist / dir.Y;
++		cam.GetOrientation().Translate(m_PanFocus - dir - ray.origin);
++		cam.UpdateFrustum();
+ 	}
+ 
+-	if (m_State == STATE_PANNING && id == 0)
++	// 2) Zoom: move along the view ray based on the change in pinch distance.
++	if (pinch > 1.0f && std::fabs(pinch - prevPinch) > 0.5f)
+ 	{
+-		CCamera& camera = *(g_Game->GetView()->GetCamera());
+-		auto [origin, dir] = camera.BuildCameraRay(x, y);
+-		dir *= m_PanDist / dir.Y;
+-		camera.GetOrientation().Translate(m_PanFocus - dir - origin);
+-		camera.UpdateFrustum();
++		const float zoomDist = (pinch - prevPinch) * -PINCH_ZOOM_FACTOR * m_PanDist;
++		CVector3D rd = cam.BuildCameraRay(c.X, c.Y).direction;
++		rd *= zoomDist;
++		cam.GetOrientation().Translate(rd);
++		cam.UpdateFrustum();
+ 	}
+ 
+-	if (m_State == STATE_ZOOMING && id == 1)
+-	{
+-		float oldDist = (m_Prev[id] - m_Pos[1 - id]).Length();
+-		float newDist = (m_Pos[id] - m_Pos[1 - id]).Length();
+-		float zoomDist = (newDist - oldDist) * -0.005f * m_PanDist;
++	// 3) Refresh the ground anchor for the next frame.
++	m_PanFocus = cam.GetWorldCoordinates(c.X, c.Y, true);
++	m_PanDist = (m_PanFocus - cam.GetOrientation().GetTranslation()).Y;
+ 
+-		CCamera& camera = *(g_Game->GetView()->GetCamera());
+-		CVector3D dir{camera.BuildCameraRay(m_Pos[0].X, m_Pos[0].Y).direction};
+-		dir *= zoomDist;
+-		camera.GetOrientation().Translate(dir);
+-		camera.UpdateFrustum();
+-
+-		m_PanFocus = camera.GetWorldCoordinates(m_Pos[0].X, m_Pos[0].Y, true);
+-		m_PanDist = (m_PanFocus - camera.GetOrientation().GetTranslation()).Y;
++	// 4) Commit the new camera transform into the camera controller. The controller
++	//    rebuilds the camera every frame from its own stored position; the direct
++	//    orientation translation above is not persisted there, so without this the
++	//    view snaps back to its pre-gesture spot as soon as the fingers lift.
++	{
++		CGameView* view = g_Game->GetView();
++		const CVector3D rot = view->GetCameraRotation();
++		view->SetCamera(cam.GetOrientation().GetTranslation(), rot.X, rot.Y, view->GetCameraZoom());
+ 	}
++
++	(void)pc;
+ }
+ 
+-void CTouchInput::Frame()
++void CTouchInput::OnFingerDown(long long id, int x, int y)
+ {
+-	double t = timer_Time();
+-	if (m_State == STATE_FIRST_TOUCH && t > m_FirstTouchTime + 1.0)
+-	{
+-		m_State = STATE_INACTIVE;
++	const int slot = FindFreeSlot();
++	if (slot < 0)
++		return;
+ 
+-		SDL_Event_ ev;
+-		ev.ev.button.button = SDL_BUTTON_RIGHT;
+-		ev.ev.button.x = m_Pos[0].X;
+-		ev.ev.button.y = m_Pos[0].Y;
++	m_Slot[slot].down = true;
++	m_Slot[slot].fingerId = id;
++	m_Slot[slot].prev = m_Slot[slot].pos = CVector2D(x, y);
+ 
+-		ev.ev.type = SDL_MOUSEBUTTONDOWN;
+-		ev.ev.button.state = SDL_PRESSED;
+-		SDL_PushEvent(&ev.ev);
+-
+-		ev.ev.type = SDL_MOUSEBUTTONUP;
+-		ev.ev.button.state = SDL_RELEASED;
+-		SDL_PushEvent(&ev.ev);
++	if (ActiveCount() == 1)
++	{
++		// First finger: wait to classify as tap / drag-box / long-press.
++		m_CameraGesture = false;
++		m_OneMode = ONE_PENDING;
++		m_DownPos = CVector2D(x, y);
++		m_DownTime = timer_Time();
+ 	}
+-}
+-
+-InReaction CTouchInput::HandleEvent([[maybe_unused]] const SDL_Event_* ev)
+-{
+-	if (!IsEnabled())
+-		return IN_PASS;
+-
+-#if EMULATE_FINGERS_WITH_MOUSE
+-	switch(ev->ev.type)
++	else
+ 	{
+-	case SDL_MOUSEBUTTONDOWN:
+-	{
+-		int button;
+-		if (ev->ev.button.button == SDL_BUTTON_LEFT)
+-			button = 0;
+-		else if (ev->ev.button.button == SDL_BUTTON_RIGHT)
+-			button = 1;
+-		else
+-			return IN_PASS;
+-
+-		m_MouseEmulateDownPos[button] = CVector2D(ev->ev.button.x, ev->ev.button.y);
+-		if (m_MouseEmulateState[button] == MOUSE_INACTIVE)
++		// Second finger down: switch to the two-finger camera gesture.
++		// Cancel any in-progress band-box selection first.
++		if (m_OneMode == ONE_BOX)
+ 		{
+-			m_MouseEmulateState[button] = MOUSE_ACTIVATING;
+-			OnFingerDown(button, ev->ev.button.x, ev->ev.button.y);
++			for (size_t i = 0; i < MAX_FINGERS; ++i)
++			{
++				if (m_Slot[i].down && static_cast<int>(i) != slot)
++				{
++					PushButtonEvent(SDL_BUTTON_LEFT, false,
++					                m_Slot[i].pos.X, m_Slot[i].pos.Y);
++					break;
++				}
++			}
+ 		}
+-		else if (m_MouseEmulateState[button] == MOUSE_ACTIVE_UP)
++		m_OneMode = ONE_IDLE;
++
++		if (InGame())
+ 		{
+-			m_MouseEmulateState[button] = MOUSE_ACTIVE_DOWN;
++			m_CameraGesture = true;
++			StartCameraGesture();
+ 		}
+-		return IN_HANDLED;
+ 	}
++}
+ 
+-	case SDL_MOUSEBUTTONUP:
++void CTouchInput::OnFingerUp(long long id, int x, int y)
++{
++	const int slot = FindSlot(id);
++	if (slot < 0)
++		return;
++
++	m_Slot[slot].pos = CVector2D(x, y);
++
++	if (m_CameraGesture)
+ 	{
+-		int button;
+-		if (ev->ev.button.button == SDL_BUTTON_LEFT)
+-			button = 0;
+-		else if (ev->ev.button.button == SDL_BUTTON_RIGHT)
+-			button = 1;
+-		else
+-			return IN_PASS;
++		m_Slot[slot].down = false;
++		m_Slot[slot].fingerId = -1;
+ 
+-		if (m_MouseEmulateState[button] == MOUSE_ACTIVATING)
++		if (ActiveCount() <= 1)
+ 		{
+-			m_MouseEmulateState[button] = MOUSE_ACTIVE_UP;
+-		}
+-		else if (m_MouseEmulateState[button] == MOUSE_ACTIVE_DOWN)
+-		{
+-			float dist = (m_MouseEmulateDownPos[button] - CVector2D(ev->ev.button.x, ev->ev.button.y)).Length();
+-			if (dist <= 2)
++			m_CameraGesture = false;
++			int rem = -1;
++			for (size_t i = 0; i < MAX_FINGERS; ++i)
++				if (m_Slot[i].down)
++					rem = static_cast<int>(i);
++
++			if (rem >= 0)
+ 			{
+-				m_MouseEmulateState[button] = MOUSE_INACTIVE;
+-				OnFingerUp(button, ev->ev.button.x, ev->ev.button.y);
++				// The remaining finger starts a fresh one-finger gesture so it
++				// does not instantly produce a selection box.
++				m_OneMode = ONE_PENDING;
++				m_DownPos = m_Slot[rem].pos;
++				m_DownTime = timer_Time();
+ 			}
+ 			else
+-			{
+-				m_MouseEmulateState[button] = MOUSE_ACTIVE_UP;
+-			}
++				m_OneMode = ONE_IDLE;
+ 		}
+-		return IN_HANDLED;
++		return;
+ 	}
+ 
+-	case SDL_MOUSEMOTION:
++	if (m_OneMode == ONE_PENDING)
+ 	{
+-		for (size_t i = 0; i < MAX_MOUSE; ++i)
++		// A quick, stationary release is a left click.
++		PushButtonEvent(SDL_BUTTON_LEFT, true, x, y);
++		PushButtonEvent(SDL_BUTTON_LEFT, false, x, y);
++	}
++	else if (m_OneMode == ONE_BOX)
++	{
++		PushMotionEvent(x, y);
++		PushButtonEvent(SDL_BUTTON_LEFT, false, x, y);
++	}
++	else if (m_OneMode == ONE_LONG)
++	{
++		// Long-press was armed while stationary; confirm the right click on release.
++		PushButtonEvent(SDL_BUTTON_RIGHT, true, x, y);
++		PushButtonEvent(SDL_BUTTON_RIGHT, false, x, y);
++	}
++
++	m_OneMode = ONE_IDLE;
++	m_Slot[slot].down = false;
++	m_Slot[slot].fingerId = -1;
++}
++
++void CTouchInput::OnFingerMotion(long long id, int x, int y)
++{
++	const int slot = FindSlot(id);
++	if (slot < 0)
++		return;
++
++	m_Slot[slot].prev = m_Slot[slot].pos;
++	m_Slot[slot].pos = CVector2D(x, y);
++
++	if (m_CameraGesture)
++	{
++		if (InGame())
++			UpdateCameraGesture();
++		return;
++	}
++
++	const CVector2D p(x, y);
++	const float dist = (p - m_DownPos).Length();
++	if (m_OneMode == ONE_PENDING || m_OneMode == ONE_LONG)
++	{
++		// "Not yet classified" and "long-press armed but not released" can both
++		// still turn into a band-box if the finger moves far enough.
++		if (InGame() && dist > BOX_THRESHOLD)
+ 		{
+-			if (m_MouseEmulateState[i] == MOUSE_ACTIVE_DOWN)
+-			{
+-				OnFingerMotion(i, ev->ev.motion.x, ev->ev.motion.y);
+-			}
++			m_OneMode = ONE_BOX;
++			PushButtonEvent(SDL_BUTTON_LEFT, true, m_DownPos.X, m_DownPos.Y);
++			PushMotionEvent(x, y);
+ 		}
+-		return IN_HANDLED;
+ 	}
++	else if (m_OneMode == ONE_BOX)
++	{
++		PushMotionEvent(x, y);
+ 	}
+-#endif
++}
+ 
+-	switch(ev->ev.type)
++void CTouchInput::Frame()
++{
++	if (m_CameraGesture || m_OneMode != ONE_PENDING)
++		return;
++
++	int slot = -1;
++	for (size_t i = 0; i < MAX_FINGERS; ++i)
++		if (m_Slot[i].down)
++			slot = static_cast<int>(i);
++
++	if (slot < 0)
++		return;
++
++	const CVector2D p = m_Slot[slot].pos;
++	if (InGame() && timer_Time() - m_DownTime >= LONG_PRESS_TIME &&
++	    (p - m_DownPos).Length() < BOX_THRESHOLD)
+ 	{
+-	case SDL_FINGERDOWN:
+-	case SDL_FINGERUP:
+-	case SDL_FINGERMOTION:
++		// Stationary long-press is ARMED but not fired: if the finger then moves
++		// it should become a band-box instead. The right click is confirmed on
++		// release (see OnFingerUp).
++		m_OneMode = ONE_LONG;
++	}
++}
++
++InReaction CTouchInput::HandleEvent([[maybe_unused]] const SDL_Event_* ev)
++{
++	if (!IsEnabled())
++		return IN_PASS;
++
++	switch (ev->ev.type)
+ 	{
+-		// Map finger events onto the mouse, for basic testing
+-		debug_printf("finger %s tid=%" PRId64 " fid=%" PRId64 " x=%f y=%f dx=%f dy=%f p=%f\n",
+-			ev->ev.type == SDL_FINGERDOWN ? "down" :
+-			ev->ev.type == SDL_FINGERUP ? "up" :
+-			ev->ev.type == SDL_FINGERMOTION ? "motion" : "?",
+-			ev->ev.tfinger.touchId, ev->ev.tfinger.fingerId,
+-			ev->ev.tfinger.x, ev->ev.tfinger.y, ev->ev.tfinger.dx, ev->ev.tfinger.dy, ev->ev.tfinger.pressure);
++	case SDL_EVENT_FINGER_DOWN:
++	case SDL_EVENT_FINGER_UP:
++	case SDL_EVENT_FINGER_MOTION:
++	{
++		const int x = static_cast<int>(g_xres * ev->ev.tfinger.x);
++		const int y = static_cast<int>(g_yres * ev->ev.tfinger.y);
++		const long long fid = static_cast<long long>(ev->ev.tfinger.fingerID);
+ 
+-		if (ev->ev.type == SDL_FINGERDOWN)
+-			OnFingerDown(ev->ev.tfinger.fingerId, g_xres * ev->ev.tfinger.x, g_yres * ev->ev.tfinger.y);
+-		else if (ev->ev.type == SDL_FINGERUP)
+-			OnFingerUp(ev->ev.tfinger.fingerId, g_xres * ev->ev.tfinger.x, g_yres * ev->ev.tfinger.y);
+-		else if (ev->ev.type == SDL_FINGERMOTION)
+-			OnFingerMotion(ev->ev.tfinger.fingerId, g_xres * ev->ev.tfinger.x, g_yres * ev->ev.tfinger.y);
++		if (ev->ev.type == SDL_EVENT_FINGER_DOWN)
++			OnFingerDown(fid, x, y);
++		else if (ev->ev.type == SDL_EVENT_FINGER_UP)
++			OnFingerUp(fid, x, y);
++		else
++			OnFingerMotion(fid, x, y);
+ 		return IN_HANDLED;
+ 	}
+ 	}
+diff -ruN --text a/source/ps/TouchInput.h b/source/ps/TouchInput.h
+--- a/source/ps/TouchInput.h	2025-12-22 11:24:50
++++ b/source/ps/TouchInput.h	2026-09-26 18:23:40
+@@ -27,8 +27,15 @@
+ struct SDL_Event_;
+ 
+ /**
+- * Maps touch events (e.g. on Android touchscreen devices) onto mouse events
+- * and camera movement.
++ * Maps touch events (e.g. on Android/HarmonyOS touchscreen devices) onto mouse
++ * events and camera movement.
++ *
++ * RTS touch model:
++ *   one-finger tap                 -> left click (select / confirm)
++ *   one-finger drag                -> band-box selection (left button drag)
++ *   one-finger long-press (~0.45s) -> right click (move/attack/gather order)
++ *   two-finger drag                -> pan the camera
++ *   two-finger pinch               -> zoom the camera
+  */
+ class CTouchInput
+ {
+@@ -41,6 +48,12 @@
+ 	 */
+ 	bool IsEnabled();
+ 
++	/**
++	 * Returns whether a two-finger camera gesture is currently in progress.
++	 * While true, the normal camera controller should yield to avoid fighting.
++	 */
++	bool IsCameraGestureActive() const;
++
+ 	InReaction HandleEvent(const SDL_Event_* ev);
+ 
+ 	/**
+@@ -49,41 +62,46 @@
+ 	void Frame();
+ 
+ private:
+-	void OnFingerDown(int id, int x, int y);
+-	void OnFingerUp(int id, int x, int y);
+-	void OnFingerMotion(int id, int x, int y);
++	struct FingerSlot
++	{
++		bool down = false;
++		long long fingerId = -1;
++		CVector2D pos;
++		CVector2D prev;
++	};
+ 
+-	// Mouse emulation state:
+-	enum
++	enum OneFingerMode
+ 	{
+-		MOUSE_INACTIVE,
+-		MOUSE_ACTIVATING,
+-		MOUSE_ACTIVE_UP,
+-		MOUSE_ACTIVE_DOWN
++		ONE_IDLE,    // no one-finger gesture
++		ONE_PENDING, // first finger down, not yet classified
++		ONE_BOX,     // band-box selection in progress (left button held)
++		ONE_LONG     // long-press already fired a right click
+ 	};
+-	static const size_t MAX_MOUSE = 2;
+-	int m_MouseEmulateState[MAX_MOUSE];
+-	CVector2D m_MouseEmulateDownPos[MAX_MOUSE];
+ 
+-	// Current finger state:
+-	static const size_t MAX_FINGERS = 2;
+-	bool m_Down[MAX_FINGERS];
+-	CVector2D m_Pos[MAX_FINGERS];
+-	CVector2D m_Prev[MAX_FINGERS];
++	void OnFingerDown(long long id, int x, int y);
++	void OnFingerUp(long long id, int x, int y);
++	void OnFingerMotion(long long id, int x, int y);
+ 
++	void PushButtonEvent(int button, bool down, int x, int y);
++	void PushMotionEvent(int x, int y);
++	int FindFreeSlot() const;
++	int FindSlot(long long fingerId) const;
++	int ActiveCount() const;
++	bool InGame() const;
++	void StartCameraGesture();
++	void UpdateCameraGesture();
+ 
+-	enum
+-	{
+-		STATE_INACTIVE,
+-		STATE_FIRST_TOUCH,
+-		STATE_PANNING,
+-		STATE_ZOOMING
+-	};
+-	int m_State;
++	static const size_t MAX_FINGERS = 2;
++	FingerSlot m_Slot[MAX_FINGERS];
+ 
+-	double m_FirstTouchTime;
+-	CVector2D m_FirstTouchPos;
++	OneFingerMode m_OneMode;
++	bool m_CameraGesture;
+ 
++	// First-finger down position/time, used to classify tap vs drag vs long-press.
++	CVector2D m_DownPos;
++	double m_DownTime;
++
++	// Camera grab/zoom state.
+ 	CVector3D m_PanFocus;
+ 	float m_PanDist;
+ };
+diff -ruN --text a/source/ps/UserReport.cpp b/source/ps/UserReport.cpp
+--- a/source/ps/UserReport.cpp	2025-12-22 11:24:50
++++ b/source/ps/UserReport.cpp	2026-09-27 09:37:14
+@@ -111,6 +111,15 @@
+ 		m_Curl = curl_easy_init();
+ 		ENSURE(m_Curl);
+ 
++#if OS_HARMONYOS
++		// The device has no OpenSSL-visible system CA store; use the CA bundle
++		// the bootstrap writes into the config dir.
++		curl_easy_setopt(m_Curl, CURLOPT_CAINFO,
++			"/data/storage/el2/base/haps/entry/files/0ad/config/cacert.pem");
++		curl_easy_setopt(m_Curl, CURLOPT_SSL_VERIFYPEER, 1L);
++		curl_easy_setopt(m_Curl, CURLOPT_SSL_VERIFYHOST, 2L);
++#endif
++
+ #if DEBUG_UPLOADS
+ 		curl_easy_setopt(m_Curl, CURLOPT_VERBOSE, 1L);
+ #endif
+diff -ruN --text a/source/ps/VideoMode.cpp b/source/ps/VideoMode.cpp
+--- a/source/ps/VideoMode.cpp	2025-12-22 11:24:50
++++ b/source/ps/VideoMode.cpp	2026-09-26 22:05:50
+@@ -173,9 +173,9 @@
+ CVideoMode::CCursor::~CCursor()
+ {
+ 	if (m_Cursor)
+-		SDL_FreeCursor(m_Cursor);
++		SDL_DestroyCursor(m_Cursor);
+ 	if (m_CursorSurface)
+-		SDL_FreeSurface(m_CursorSurface);
++		SDL_DestroySurface(m_CursorSurface);
+ }
+ 
+ void CVideoMode::CCursor::SetCursor(const CStrW& name)
+@@ -185,13 +185,13 @@
+ 	m_CursorName = name;
+ 
+ 	if (m_Cursor)
+-		SDL_FreeCursor(m_Cursor);
++		SDL_DestroyCursor(m_Cursor);
+ 	if (m_CursorSurface)
+-		SDL_FreeSurface(m_CursorSurface);
++		SDL_DestroySurface(m_CursorSurface);
+ 
+ 	if (name.empty())
+ 	{
+-		SDL_ShowCursor(SDL_DISABLE);
++		SDL_HideCursor();
+ 		return;
+ 	}
+ 
+@@ -244,10 +244,10 @@
+ 		return;
+ 	}
+ 
+-	m_CursorSurface = SDL_CreateRGBSurfaceFrom(imageBGRA,
+-		static_cast<int>(t.m_Width), static_cast<int>(t.m_Height), 32,
+-		static_cast<int>(t.m_Width * 4),
+-		0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
++	m_CursorSurface = SDL_CreateSurfaceFrom(
++		static_cast<int>(t.m_Width), static_cast<int>(t.m_Height),
++		SDL_PIXELFORMAT_BGRA32,
++		imageBGRA, static_cast<int>(t.m_Width * 4));
+ 	if (!m_CursorSurface)
+ 	{
+ 		LOGERROR("Can't create surface for cursor: %s", SDL_GetError());
+@@ -256,18 +256,18 @@
+ 	const float scale = g_VideoMode.GetScale();
+ 	if (scale != 1.0)
+ 	{
+-		SDL_Surface* scaledSurface = SDL_CreateRGBSurface(0,
+-			m_CursorSurface->w * scale,
+-			m_CursorSurface->h * scale, 32,
+-			0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
++		SDL_Surface* scaledSurface = SDL_CreateSurface(
++			static_cast<int>(m_CursorSurface->w * scale),
++			static_cast<int>(m_CursorSurface->h * scale),
++			SDL_PIXELFORMAT_BGRA32);
+ 		if (!scaledSurface)
+ 		{
+ 			LOGERROR("Can't create scaled surface forcursor: %s", SDL_GetError());
+ 			return;
+ 		}
+-		if (SDL_BlitScaled(m_CursorSurface, nullptr, scaledSurface, nullptr))
++		if (!SDL_BlitSurfaceScaled(m_CursorSurface, nullptr, scaledSurface, nullptr, SDL_SCALEMODE_LINEAR))
+ 			return;
+-		SDL_FreeSurface(m_CursorSurface);
++		SDL_DestroySurface(m_CursorSurface);
+ 		m_CursorSurface = scaledSurface;
+ 	}
+ 	m_Cursor = SDL_CreateColorCursor(m_CursorSurface, hotspotX, hotspotY);
+@@ -292,6 +292,17 @@
+ 
+ CVideoMode::~CVideoMode() = default;
+ 
++#if OS_HARMONYOS
++static void OH_VMTrace(const char* fmt, ...)
++{
++	FILE* f = fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt", "a");
++	if (!f) return;
++	va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
++	fprintf(f, "\n");
++	fclose(f);
++}
++#endif
++
+ void CVideoMode::ReadConfig()
+ {
+ 	m_ConfigFullscreen = !g_ConfigDB.Get("windowed", !m_ConfigFullscreen);
+@@ -315,6 +326,18 @@
+ 	else
+ 		m_Backend = Renderer::Backend::Backend::GL;
+ 
++#if OS_HARMONYOS
++	// The legacy fixed-function / ARB-assembly GL backend is unsupported by the
++	// HarmonyOS graphics stack (device creation hangs and the app is killed), so
++	// silently fall back to the modern GL backend.
++	if (m_Backend == Renderer::Backend::Backend::GL_ARB)
++		m_Backend = Renderer::Backend::Backend::GL;
++#endif
++
++#if OS_HARMONYOS
++	OH_VMTrace("readconfig rbstr=%s backend=%d fs=%d vsync=%d", rendererBackend.c_str(), (int)m_Backend, (int)m_ConfigFullscreen, (int)m_ConfigVSync);
++#endif
++
+ #if OS_WIN
+ 	if (m_ConfigEnableHiDPI)
+ 		wutil_EnableHiDPIOnWindows();
+@@ -323,11 +346,24 @@
+ 
+ bool CVideoMode::SetVideoMode(int w, int h, int bpp, bool fullscreen)
+ {
++#if OS_HARMONYOS
++	OH_VMTrace("setvideomode w=%d h=%d fs=%d backend=%d first=%d", w, h, (int)fullscreen, (int)m_Backend, m_Window ? 0 : 1);
++#endif
++	// On HarmonyOS the first window is created in windowed mode and only switched
++	// to fullscreen after the renderer/GUI are live (the engine calls SetFullscreen
++	// again), so the maximize transition never races EGL surface creation.
++	bool actualFullscreen = fullscreen;
++#if OS_HARMONYOS
++	if (!m_Window)
++		actualFullscreen = false;
++#endif
++
+ 	Uint32 flags = 0;
+-	if (fullscreen)
++	if (actualFullscreen)
+ 	{
+-		flags |= g_ConfigDB.Get("borderless.fullscreen", true) ? SDL_WINDOW_FULLSCREEN_DESKTOP :
+-			SDL_WINDOW_FULLSCREEN;
++		// SDL3's SDL_WINDOW_FULLSCREEN is the desktop/borderless mode, best
++		// supported on HarmonyOS PC.
++		flags |= SDL_WINDOW_FULLSCREEN;
+ 	}
+ 	else if (g_ConfigDB.Get("borderless.window", false))
+ 		flags |= SDL_WINDOW_BORDERLESS;
+@@ -393,9 +429,9 @@
+ 		}
+ 
+ 		// Note: these flags only take affect in SDL_CreateWindow
+-		flags |= SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
++		flags |= SDL_WINDOW_RESIZABLE;
+ 		if (m_ConfigEnableHiDPI)
+-			flags |= SDL_WINDOW_ALLOW_HIGHDPI;
++			flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+ 		if (isGLBackend)
+ 			flags |= SDL_WINDOW_OPENGL;
+ 		else if (m_Backend == Renderer::Backend::Backend::VULKAN)
+@@ -415,14 +451,16 @@
+ 			{
+ 				LOGWARNING("Failed to load %s.", fullPathToVulkanLibrary.c_str());
+ 				DowngradeBackendSettingAfterCreationFailure();
+-				return SetVideoMode(w, h, bpp, fullscreen);
++				return SetVideoMode(w, h, bpp, actualFullscreen);
+ 			}
+ 			else
+ 				LOGMESSAGE("Loaded %s.", fullPathToVulkanLibrary.c_str());
+ 		}
+ #endif
+ 
+-		m_Window = SDL_CreateWindow(main_window_name, m_WindowedX, m_WindowedY, w, h, flags);
++		m_Window = SDL_CreateWindow(main_window_name, w, h, flags);
++		if (m_Window)
++			SDL_SetWindowPosition(m_Window, m_WindowedX, m_WindowedY);
+ 		if (!m_Window)
+ 		{
+ 			// SDL might fail to create a window in case of missing a Vulkan driver.
+@@ -430,7 +468,7 @@
+ 			{
+ 				LOGWARNING("Failed to create a Vulkan window: %s", SDL_GetError());
+ 				DowngradeBackendSettingAfterCreationFailure();
+-				return SetVideoMode(w, h, bpp, fullscreen);
++				return SetVideoMode(w, h, bpp, actualFullscreen);
+ 			}
+ 
+ 			// If fullscreen fails, try windowed mode
+@@ -455,7 +493,7 @@
+ 						// (The rendering may be ugly but this helps when running in VMware)
+ 						SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+ 
+-						return SetVideoMode(w, h, bpp, fullscreen);
++						return SetVideoMode(w, h, bpp, actualFullscreen);
+ 					}
+ 				}
+ 
+@@ -465,13 +503,6 @@
+ 			}
+ 		}
+ 
+-		if (SDL_SetWindowDisplayMode(m_Window, NULL) < 0)
+-		{
+-			LOGERROR("SetVideoMode failed in SDL_SetWindowDisplayMode: %dx%d:%d %d (\"%s\")",
+-				w, h, bpp, fullscreen ? 1 : 0, SDL_GetError());
+-			return false;
+-		}
+-
+ #if OS_WIN
+ 		// We need to set the window for an error dialog.
+ 		wutil_SetAppWindow(m_Window);
+@@ -482,7 +513,7 @@
+ 			DowngradeBackendSettingAfterCreationFailure();
+ 			SDL_DestroyWindow(m_Window);
+ 			m_Window = nullptr;
+-			return SetVideoMode(w, h, bpp, fullscreen);
++			return SetVideoMode(w, h, bpp, actualFullscreen);
+ 		}
+ 
+ 		if (isGLBackend)
+@@ -490,9 +521,9 @@
+ 	}
+ 	else
+ 	{
+-		if (m_IsFullscreen != fullscreen)
++		if (m_IsFullscreen != actualFullscreen)
+ 		{
+-			if (!fullscreen)
++			if (!actualFullscreen)
+ 			{
+ 				// For some reason, when switching from fullscreen to windowed mode,
+ 				// we have to set the window size and position before and after switching
+@@ -500,15 +531,15 @@
+ 				SDL_SetWindowPosition(m_Window, m_WindowedX, m_WindowedY);
+ 			}
+ 
+-			if (SDL_SetWindowFullscreen(m_Window, flags) < 0)
++			if (!SDL_SetWindowFullscreen(m_Window, actualFullscreen))
+ 			{
+ 				LOGERROR("SetVideoMode failed in SDL_SetWindowFullscreen: %dx%d:%d %d (\"%s\")",
+-					w, h, bpp, fullscreen ? 1 : 0, SDL_GetError());
++					w, h, bpp, actualFullscreen ? 1 : 0, SDL_GetError());
+ 				return false;
+ 			}
+ 		}
+ 
+-		if (!fullscreen)
++		if (!actualFullscreen)
+ 		{
+ 			SDL_SetWindowSize(m_Window, w, h);
+ 			SDL_SetWindowPosition(m_Window, m_WindowedX, m_WindowedY);
+@@ -521,15 +552,15 @@
+ 
+ 	// #545: we need to constrain the window in fullscreen mode to avoid mouse
+ 	// "falling out" of the window in case of multiple displays.
+-	if (fullscreen ? g_ConfigDB.Get("window.mousegrabinfullscreen", true) :
++	if (actualFullscreen ? g_ConfigDB.Get("window.mousegrabinfullscreen", true) :
+ 		g_ConfigDB.Get("window.mousegrabinwindowmode", false))
+ 	{
+-		SDL_SetWindowGrab(m_Window, SDL_TRUE);
++		SDL_SetWindowMouseGrab(m_Window, true);
+ 	}
+ 	else
+-		SDL_SetWindowGrab(m_Window, SDL_FALSE);
++		SDL_SetWindowMouseGrab(m_Window, false);
+ 
+-	m_IsFullscreen = fullscreen;
++	m_IsFullscreen = actualFullscreen;
+ 
+ 	g_xres = m_CurrentW;
+ 	g_yres = m_CurrentH;
+@@ -546,13 +577,13 @@
+ 	// preferred video mode = current desktop settings
+ 	// (command line params may override these)
+ 	// TODO: handle multi-screen and HiDPI properly.
+-	SDL_DisplayMode mode;
+-	if (SDL_GetDesktopDisplayMode(0, &mode) == 0)
++	const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
++	if (mode)
+ 	{
+-		m_PreferredW = mode.w;
+-		m_PreferredH = mode.h;
+-		m_PreferredBPP = SDL_BITSPERPIXEL(mode.format);
+-		m_PreferredFreq = mode.refresh_rate;
++		m_PreferredW = mode->w;
++		m_PreferredH = mode->h;
++		m_PreferredBPP = SDL_BITSPERPIXEL(mode->format);
++		m_PreferredFreq = static_cast<int>(mode->refresh_rate);
+ 	}
+ 
+ 	int w = m_ConfigW;
+@@ -684,6 +715,9 @@
+ 		}
+ 		break;
+ 	}
++#if OS_HARMONYOS
++	OH_VMTrace("trycreatedevice backend=%d ok=%d", (int)m_Backend, (int)static_cast<bool>(m_BackendDevice));
++#endif
+ 	return static_cast<bool>(m_BackendDevice);
+ }
+ 
+@@ -720,6 +754,32 @@
+ 	return true;
+ }
+ 
++void CVideoMode::HarmonyPollSurfaceSize()
++{
++#if OS_HARMONYOS
++	if (!m_IsInitialised || !m_Window)
++		return;
++
++	int pixelW = 0, pixelH = 0;
++	SDL_GetWindowSizeInPixels(m_Window, &pixelW, &pixelH);
++	if (pixelW < 2 || pixelH < 2)
++		return;
++
++	if (pixelW == m_CurrentW && pixelH == m_CurrentH)
++		return;
++
++	LOGMESSAGE("HarmonyOS surface resized without callback: %dx%d -> %dx%d",
++		m_CurrentW, m_CurrentH, pixelW, pixelH);
++
++	m_CurrentW = m_WindowedW = pixelW;
++	m_CurrentH = m_WindowedH = pixelH;
++	g_xres = pixelW;
++	g_yres = pixelH;
++
++	UpdateRenderer(pixelW, pixelH);
++#endif
++}
++
+ void CVideoMode::Rescale(float scale)
+ {
+ 	ENSURE(m_IsInitialised);
+@@ -927,14 +987,14 @@
+ 	if (!bgra_img)
+ 		return;
+ 
+-	SDL_Surface *iconSurface = SDL_CreateRGBSurfaceFrom(bgra_img,
+-		iconTexture.m_Width, iconTexture.m_Height, 32, iconTexture.m_Width * 4,
+-		0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
++	SDL_Surface *iconSurface = SDL_CreateSurfaceFrom(
++		static_cast<int>(iconTexture.m_Width), static_cast<int>(iconTexture.m_Height),
++		SDL_PIXELFORMAT_BGRA32, bgra_img, static_cast<int>(iconTexture.m_Width * 4));
+ 	if (!iconSurface)
+ 		return;
+ 
+ 	SDL_SetWindowIcon(m_Window, iconSurface);
+-	SDL_FreeSurface(iconSurface);
++	SDL_DestroySurface(iconSurface);
+ }
+ 
+ void CVideoMode::SetCursor(const CStrW& name)
+diff -ruN --text a/source/ps/VideoMode.h b/source/ps/VideoMode.h
+--- a/source/ps/VideoMode.h	2025-12-22 11:24:50
++++ b/source/ps/VideoMode.h	2026-09-26 17:46:10
+@@ -60,6 +60,12 @@
+ 	 */
+ 	bool ResizeWindow(int w, int h);
+ 
++	// HarmonyOS PC safety net: ArkUI does not always deliver the XComponent
++	// OnSurfaceChanged callback while a free-form window is resized. Poll the
++	// native window's pixel size each frame and, if it changed, rebuild the
++	// swapchain / renderer / GUI without relying on that callback.
++	void HarmonyPollSurfaceSize();
++
+ 	/**
+ 	 * Set scale and tell dependent compoenent to recompute sizes.
+ 	 */
+diff -ruN --text a/source/ps/VisualReplay.cpp b/source/ps/VisualReplay.cpp
+--- a/source/ps/VisualReplay.cpp	2025-12-22 11:24:50
++++ b/source/ps/VisualReplay.cpp	2026-09-26 15:42:30
+@@ -41,7 +41,6 @@
+ #include "scriptinterface/ScriptRequest.h"
+ 
+ #include <SDL_events.h>
+-#include <SDL_quit.h>
+ #include <fstream>
+ #include <iterator>
+ #include <js/Array.h>
+@@ -176,7 +175,8 @@
+ 	{
+ 		// This cannot use IsQuitRequested(), because the current loop and that function both run in the main thread.
+ 		// So SDL events are not processed unless called explicitly here.
+-		if (SDL_QuitRequested())
++		SDL_PumpEvents();
++		if (SDL_HasEvent(SDL_EVENT_QUIT))
+ 			// Don't return, because we want to save our progress
+ 			break;
+ 
+diff -ruN --text a/source/ps/containers/StaticVector.h b/source/ps/containers/StaticVector.h
+--- a/source/ps/containers/StaticVector.h	2025-12-22 11:24:50
++++ b/source/ps/containers/StaticVector.h	2026-09-26 15:18:41
+@@ -18,6 +18,7 @@
+ #ifndef INCLUDED_PS_STATICVECTOR
+ #define INCLUDED_PS_STATICVECTOR
+ 
++#include "lib/debug.h"
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
+diff -ruN --text a/source/ps/tests/test_Hotkeys.h b/source/ps/tests/test_Hotkeys.h
+--- a/source/ps/tests/test_Hotkeys.h	2025-12-22 11:24:50
++++ b/source/ps/tests/test_Hotkeys.h	2026-09-26 15:25:01
+@@ -53,7 +53,7 @@
+ 	void fakeInput(const char* key, bool keyDown)
+ 	{
+ 		SDL_Event_ ev;
+-		ev.ev.type = keyDown ? SDL_KEYDOWN : SDL_KEYUP;
++		ev.ev.type = keyDown ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+ 		ev.ev.key.repeat = 0;
+ 		ev.ev.key.keysym.scancode = SDL_GetScancodeFromName(key);
+ 		GlobalsInputHandler(&ev);
+diff -ruN --text a/source/renderer/OverlayRenderer.cpp b/source/renderer/OverlayRenderer.cpp
+--- a/source/renderer/OverlayRenderer.cpp	2025-12-22 11:24:51
++++ b/source/renderer/OverlayRenderer.cpp	2026-09-26 23:45:01
+@@ -255,17 +255,32 @@
+ 	defsOverlayLineAlwaysVisible.Add(str_IGNORE_LOS, str_1);
+ }
+ 
++#if defined(__OHOS__)
++#include <stdio.h>
++static void OH_OVInitTrace(const char* t)
++{ FILE* f=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a");
++  if(f){fprintf(f,"%s\n",t);fclose(f);} }
++#endif
+ void OverlayRendererInternals::Initialize()
+ {
++#if defined(__OHOS__)
++	OH_OVInitTrace("ov entry");
++#endif
+ 	// Perform any initialization after graphics capabilities have been detected. Notably,
+ 	// only at this point can we safely allocate backend buffer (in contrast to e.g. in the constructor),
+ 	// because their creation depends on the shader path, which is not reliably set before this point.
+ 
+ 	quadVertices.SetNumberOfVertices(MAX_QUAD_OVERLAYS * 4);
+ 	quadVertices.Layout(); // allocate backing store
++#if defined(__OHOS__)
++	OH_OVInitTrace("ov after-vlayout");
++#endif
+ 
+ 	quadIndices.SetNumberOfVertices(MAX_QUAD_OVERLAYS * 6);
+ 	quadIndices.Layout(); // allocate backing store
++#if defined(__OHOS__)
++	OH_OVInitTrace("ov after-ilayout");
++#endif
+ 
+ 	// Since the quads in the vertex array are independent and always consist of exactly 4 vertices per quad, the
+ 	// indices are always the same; we can therefore fill in all the indices once and pretty much forget about
+@@ -280,8 +295,14 @@
+ 		*index++ = i * 4 + 3;
+ 		*index++ = i * 4 + 0;
+ 	}
++#if defined(__OHOS__)
++	OH_OVInitTrace("ov before-upload");
++#endif
+ 	quadIndices.Upload();
+ 	quadIndices.FreeBackingStore();
++#if defined(__OHOS__)
++	OH_OVInitTrace("ov after-bufferupload");
++#endif
+ 
+ 	shaderTexLineNormal =
+ 		CreateShader(str_overlay_line, defsOverlayLineNormal, true);
+@@ -294,6 +315,9 @@
+ 	shaderOverlaySolid =
+ 		CreateShader(str_overlay_solid, {}, true);
+ 
++#if defined(__OHOS__)
++	OH_OVInitTrace("ov after-shaders");
++#endif
+ 	const uint32_t quadStride = quadVertices.GetStride();
+ 	const std::array<Renderer::Backend::SVertexAttributeFormat, 3> quadAttributes{{
+ 		{Renderer::Backend::VertexAttributeStream::POSITION,
+@@ -326,6 +350,9 @@
+ 	sphereVertexInputLayout = g_Renderer.GetVertexInputLayout(shpereAttributes);
+ 
+ 	texturedLineVertexInputLayout = CTexturedLineRData::GetVertexInputLayout();
++#if defined(__OHOS__)
++	OH_OVInitTrace("ov done");
++#endif
+ }
+ 
+ OverlayRenderer::OverlayRenderer()
+diff -ruN --text a/source/renderer/PostprocManager.cpp b/source/renderer/PostprocManager.cpp
+--- a/source/renderer/PostprocManager.cpp	2025-12-22 11:24:51
++++ b/source/renderer/PostprocManager.cpp	2026-09-26 23:27:16
+@@ -144,6 +144,14 @@
+ 	}
+ }
+ 
++#if defined(__OHOS__)
++#include <stdio.h>
++static void OH_PPInitTrace(const char* t)
++{
++    FILE* f = fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt", "a");
++    if (f) { fprintf(f, "%s\n", t); fclose(f); }
++}
++#endif
+ void CPostprocManager::Initialize()
+ {
+ 	if (m_IsInitialized)
+@@ -158,6 +166,9 @@
+ 			Renderer::Backend::VertexAttributeRate::PER_VERTEX, 1},
+ 	}};
+ 	m_VertexInputLayout = g_Renderer.GetVertexInputLayout(attributes);
++#if defined(__OHOS__)
++	OH_PPInitTrace("pp after-vil");
++#endif
+ 
+ 	const uint32_t maxSamples = m_Device->GetCapabilities().maxSampleCount;
+ 	const uint32_t possibleSampleCounts[] = {2, 4, 8, 16};
+@@ -168,8 +179,14 @@
+ 
+ 	// The screen size starts out correct and then must be updated with Resize()
+ 	RecalculateSize(g_Renderer.GetWidth(), g_Renderer.GetHeight());
++#if defined(__OHOS__)
++	OH_PPInitTrace("pp after-recalc");
++#endif
+ 
+ 	RecreateBuffers();
++#if defined(__OHOS__)
++	OH_PPInitTrace("pp after-recreate");
++#endif
+ 	m_IsInitialized = true;
+ 
+ 	// Once we have initialised the buffers, we can update the techniques.
+@@ -177,12 +194,21 @@
+ 	UpdateSharpeningTechnique();
+ 	UpdateSharpnessFactor();
+ 	SetUpscaleTechnique(g_ConfigDB.Get("renderer.upscale.technique", std::string{}));
++#if defined(__OHOS__)
++	OH_PPInitTrace("pp after-techniques");
++#endif
+ 
+ 	// This might happen after the map is loaded and the effect chosen
+ 	SetPostEffect(m_PostProcEffect);
++#if defined(__OHOS__)
++	OH_PPInitTrace("pp after-posteffect");
++#endif
+ 
+ 	if (m_Device->GetCapabilities().computeShaders)
+ 		m_DownscaleComputeTech = g_Renderer.GetShaderManager().LoadEffect(CStrIntern("compute_downscale"));
++#if defined(__OHOS__)
++	OH_PPInitTrace("pp done");
++#endif
+ }
+ 
+ void CPostprocManager::Resize()
+@@ -213,6 +239,9 @@
+ 	// Two fullscreen ping-pong textures.
+ 	GEN_BUFFER_RGBA(m_ColorTex1, m_Width, m_Height);
+ 	GEN_BUFFER_RGBA(m_ColorTex2, m_Width, m_Height);
++#if defined(__OHOS__)
++	OH_PPInitTrace("rb color");
++#endif
+ 
+ 	if (m_UnscaledWidth != m_Width && m_Device->GetCapabilities().computeShaders)
+ 	{
+@@ -260,6 +289,9 @@
+ 		for (BlurScale::Step& step : scale.steps)
+ 		{
+ 			GEN_BUFFER_RGBA(step.texture, width, height);
++#if defined(__OHOS__)
++			{ char _b[160]; snprintf(_b,sizeof _b,"blur step tex %ux%u -> %p",width,height,(void*)step.texture.get()); OH_PPInitTrace(_b); }
++#endif
+ 			Renderer::Backend::SColorAttachment colorAttachment{};
+ 			colorAttachment.texture = step.texture.get();
+ 			colorAttachment.loadOp = Renderer::Backend::AttachmentLoadOp::LOAD;
+@@ -267,12 +299,18 @@
+ 			colorAttachment.clearColor = CColor{0.0f, 0.0f, 0.0f, 0.0f};
+ 			step.framebuffer = m_Device->CreateFramebuffer(
+ 				"BlurScaleStepFramebuffer", &colorAttachment, nullptr);
++#if defined(__OHOS__)
++			{ char _b[120]; snprintf(_b,sizeof _b,"blur step fb -> %p",(void*)step.framebuffer.get()); OH_PPInitTrace(_b); }
++#endif
+ 		}
+ 		width = std::max(1u, width / 2);
+ 		height = std::max(1u, height / 2);
+ 	}
+ 
+-	#undef GEN_BUFFER_RGBA
++	#if defined(__OHOS__)
++	OH_PPInitTrace("rb blur");
++#endif
++#undef GEN_BUFFER_RGBA
+ 
+ 	// Allocate the Depth/Stencil texture.
+ 	m_DepthTex = m_Device->CreateTexture2D("PostProcDepthTexture",
+@@ -287,6 +325,9 @@
+ 			Renderer::Backend::Sampler::Filter::LINEAR,
+ 			Renderer::Backend::Sampler::AddressMode::CLAMP_TO_EDGE));
+ 
++#if defined(__OHOS__)
++	OH_PPInitTrace("rb depth");
++#endif
+ 	// Set up the framebuffers with some initial textures.
+ 	Renderer::Backend::SColorAttachment colorAttachment{};
+ 	colorAttachment.texture = m_ColorTex1.get();
+@@ -311,6 +352,9 @@
+ 	colorAttachment.texture = m_ColorTex2.get();
+ 	m_PongFramebuffer = m_Device->CreateFramebuffer("PostprocPongFramebuffer",
+ 		&colorAttachment, nullptr);
++#if defined(__OHOS__)
++	OH_PPInitTrace("rb fbs");
++#endif
+ 
+ 	if (!m_CaptureFramebuffer || !m_PingFramebuffer || !m_PongFramebuffer)
+ 	{
+@@ -323,6 +367,9 @@
+ 		DestroyMultisampleBuffer();
+ 		CreateMultisampleBuffer();
+ 	}
++#if defined(__OHOS__)
++	OH_PPInitTrace("rb ms");
++#endif
+ }
+ 
+ 
+diff -ruN --text a/source/renderer/Renderer.cpp b/source/renderer/Renderer.cpp
+--- a/source/renderer/Renderer.cpp	2025-12-22 11:24:51
++++ b/source/renderer/Renderer.cpp	2026-09-27 00:39:57
+@@ -264,6 +264,14 @@
+  * Struct CRendererInternals: Truly hide data that is supposed to be hidden
+  * in this structure so it won't even appear in header files.
+  */
++#if OS_HARMONYOS
++static void OH_RenTrace(const char* tag)
++{
++	FILE* f = fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt", "a");
++	if (f) { fprintf(f, "%s\n", tag); fclose(f); }
++}
++#endif
++
+ class CRenderer::Internals
+ {
+ 	NONCOPYABLE(Internals);
+@@ -319,11 +327,15 @@
+ 
+ 	Internals(Renderer::Backend::IDevice* device) :
+ 		device(device),
+-		deviceCommandContext(device->CreateCommandContext()),
++		deviceCommandContext((OH_RenTrace("int before-cmdctx"), device->CreateCommandContext())),
+ 		IsOpen(false), ShadersDirty(true), profileTable(g_Renderer.m_Stats, linearAllocator),
+-		shaderManager(device), textureManager(g_VFS, false, device), vertexBufferManager(device),
+-		postprocManager(device), sceneRenderer(device)
++		shaderManager((OH_RenTrace("int before-shader"), device)),
++		textureManager((OH_RenTrace("int before-tex"), g_VFS), false, device),
++		vertexBufferManager((OH_RenTrace("int before-vb"), device)),
++		postprocManager((OH_RenTrace("int before-post"), device)),
++		sceneRenderer((OH_RenTrace("int before-scene"), device))
+ 	{
++		OH_RenTrace("int done");
+ 	}
+ };
+ 
+@@ -347,8 +359,9 @@
+ CRenderer::CRenderer(Renderer::Backend::IDevice* device)
+ {
+ 	PROFILE2("InitRenderer");
+-
++	OH_RenTrace("ren before-internals");
+ 	m = std::make_unique<Internals>(device);
++	OH_RenTrace("ren after-internals");
+ 
+ 	g_ProfileViewer.AddRootTable(&m->profileTable);
+ 
+@@ -358,18 +371,24 @@
+ 	m_Stats.Reset();
+ 
+ 	// Create terrain related stuff.
++	OH_RenTrace("ren before-terraintex");
+ 	new CTerrainTextureManager(device);
++	OH_RenTrace("ren after-terraintex");
+ 
++	OH_RenTrace("ren before-open");
+ 	Open(g_xres, g_yres);
++	OH_RenTrace("ren after-open");
+ 
+ 	// Setup lighting environment. Since the Renderer accesses the
+ 	// lighting environment through a pointer, this has to be done before
+ 	// the first Frame.
+ 	GetSceneRenderer().SetLightEnv(&g_LightEnv);
+ 
++	OH_RenTrace("ren before-modelinit");
+ 	ModelDefActivateFastImpl();
+ 	ColorActivateFastImpl();
+ 	ModelRenderer::Init();
++	OH_RenTrace("ren after-modelinit");
+ }
+ 
+ CRenderer::~CRenderer()
+@@ -400,14 +419,23 @@
+ 	m_Height = height;
+ 
+ 	// Validate the currently selected render path
++	OH_RenTrace("open before-renderpath");
+ 	SetRenderPath(g_RenderingOptions.GetRenderPath());
++	OH_RenTrace("open after-renderpath");
+ 
+ 	m->debugRenderer.Initialize();
++	OH_RenTrace("open after-debug");
+ 
+ 	if (m->postprocManager.IsEnabled())
++	{
++		OH_RenTrace("open before-postproc");
+ 		m->postprocManager.Initialize();
++		OH_RenTrace("open after-postproc");
++	}
+ 
++	OH_RenTrace("open before-sceneinit");
+ 	m->sceneRenderer.Initialize();
++	OH_RenTrace("open after-sceneinit");
+ 
+ 	return true;
+ }
+@@ -520,6 +548,14 @@
+ 
+ 	// start new frame
+ 	BeginFrame();
++#if defined(__OHOS__)
++	static bool s_gameFrameTraced = false;
++	const bool traceFrame = (g_Game && g_Game->IsGameStarted() && !s_gameFrameTraced);
++	if (traceFrame) s_gameFrameTraced = true;
++	auto FTRACE = [&](const char* t) { if(!traceFrame) return;
++		FILE* f=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a");
++		if(f){fprintf(f,"frame %s\n",t);fclose(f);} };
++#endif
+ 
+ 	if (g_Game && g_Game->IsGameStarted())
+ 	{
+@@ -561,6 +597,9 @@
+ 		m->deviceCommandContext->SetViewports(1, &viewportRect);
+ 
+ 		g_Game->GetView()->Render(m->deviceCommandContext.get());
++#if defined(__OHOS__)
++		FTRACE("after-viewrender");
++#endif
+ 
+ 		if (postprocManager.IsEnabled())
+ 		{
+@@ -570,17 +609,32 @@
+ 				postprocManager.ResolveMultisampleFramebuffer(m->deviceCommandContext.get());
+ 
+ 			postprocManager.ApplyPostproc(m->deviceCommandContext.get());
++#if defined(__OHOS__)
++			FTRACE("after-applypostproc");
++#endif
+ 
++#if defined(__OHOS__)
++			FTRACE("before-getbackbuffer");
++#endif
+ 			Renderer::Backend::IFramebuffer* backbuffer =
+ 				m->deviceCommandContext->GetDevice()->GetCurrentBackbuffer(
+ 					Renderer::Backend::AttachmentLoadOp::LOAD,
+ 					Renderer::Backend::AttachmentStoreOp::STORE,
+ 					Renderer::Backend::AttachmentLoadOp::LOAD,
+ 					Renderer::Backend::AttachmentStoreOp::DONT_CARE);
++#if defined(__OHOS__)
++			FTRACE("after-getbackbuffer");
++#endif
+ 			postprocManager.BlitOutputFramebuffer(
+ 				m->deviceCommandContext.get(), backbuffer);
++#if defined(__OHOS__)
++			FTRACE("after-blitoutput");
++#endif
+ 
+ 			m->deviceCommandContext->BeginFramebufferPass(backbuffer);
++#if defined(__OHOS__)
++			FTRACE("after-beginpass");
++#endif
+ 
+ 			Renderer::Backend::IDeviceCommandContext::Rect viewportRect{};
+ 			viewportRect.width = m_Width;
+@@ -589,6 +643,9 @@
+ 		}
+ 
+ 		g_Game->GetView()->RenderOverlays(m->deviceCommandContext.get());
++#if defined(__OHOS__)
++		FTRACE("after-renderoverlays");
++#endif
+ 
+ 		g_Game->GetView()->GetCinema()->Render();
+ 	}
+@@ -624,10 +681,16 @@
+ 	}
+ 
+ 	RenderFrame2D(renderGUI, renderLogger);
++#if defined(__OHOS__)
++	FTRACE("after-frame2d");
++#endif
+ 
+ 	m->deviceCommandContext->EndFramebufferPass();
+ 
+ 	EndFrame();
++#if defined(__OHOS__)
++	FTRACE("after-endframe");
++#endif
+ 
+ 	const Stats& stats = GetStats();
+ 	PROFILE2_ATTR("draw calls: %zu", stats.m_DrawCalls);
+diff -ruN --text a/source/renderer/SceneRenderer.cpp b/source/renderer/SceneRenderer.cpp
+--- a/source/renderer/SceneRenderer.cpp	2025-12-22 11:24:51
++++ b/source/renderer/SceneRenderer.cpp	2026-09-27 12:07:46
+@@ -44,6 +44,7 @@
+ #include "maths/Vector4D.h"
+ #include "ps/CStrIntern.h"
+ #include "ps/CStrInternStatic.h"
++#include "ps/CLogger.h"
+ #include "ps/Game.h"
+ #include "ps/Profile.h"
+ #include "renderer/CPUSkinnedModelRenderer.h"
+@@ -231,6 +232,11 @@
+ 		m->globalContext.Add(str_SHADOWS_CASCADE_COUNT, cascadeCountStr[cascadeCount]);
+ #if CONFIG2_GLES
+ 		const bool useShadowSampler{device->GetBackend() != Renderer::Backend::Backend::GL};
++#elif defined(__OHOS__)
++		// The GL_EXT_shadow_samplers shadow2D() overload is unreliable on this
++		// driver, so use the manual depth-comparison path (plain sampler2D shadowTex
++		// + texture2D, see shadows_fragment.h), which needs no shadow-sampler.
++		const bool useShadowSampler{false};
+ #else
+ 		const bool useShadowSampler{true};
+ #endif
+@@ -264,13 +270,23 @@
+ 	m->Model.TranspUnskinned = ModelRendererPtr(new ShaderModelRenderer(m->Model.VertexInstancingShader));
+ }
+ 
++#if defined(__OHOS__)
++#include <stdio.h>
++static void OH_SRInitTrace(const char* t)
++{ FILE* f=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a");
++  if(f){fprintf(f,"%s\n",t);fclose(f);} }
++#endif
+ void CSceneRenderer::Initialize()
+ {
+ 	// Let component renderers perform one-time initialization after graphics capabilities and
+ 	// the shader path have been determined.
++	OH_SRInitTrace("sr before-water");
+ 	m->waterManager.Initialize();
++	OH_SRInitTrace("sr after-water");
+ 	m->terrainRenderer.Initialize();
++	OH_SRInitTrace("sr after-terrain");
+ 	m->overlayRenderer.Initialize();
++	OH_SRInitTrace("sr after-overlay");
+ }
+ 
+ // resize renderer view
+@@ -863,14 +879,30 @@
+ 	PROFILE3("render submissions");
+ 	GPU_SCOPED_LABEL(deviceCommandContext, "Render submissions");
+ 
++#if defined(__OHOS__)
++	static int s_subFrame = 0;
++	const bool traceFirst = (s_subFrame < 1);
++	++s_subFrame;
++	auto RST = [&](const char* t) { if(!traceFirst) return;
++		FILE* f=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a");
++		if(f){fprintf(f,"sub %s\n",t);fclose(f);} };
++	RST("entry");
++#endif
++
+ 	CShaderDefines context = m->globalContext;
+ 
+ 	constexpr int cullGroup = CULL_DEFAULT;
+ 
+ 	m->skyManager.RenderSky(deviceCommandContext);
++#if defined(__OHOS__)
++	RST("after-sky");
++#endif
+ 
+ 	// render submitted patches and models
+ 	RenderPatches(deviceCommandContext, context, cullGroup);
++#if defined(__OHOS__)
++	RST("after-patches");
++#endif
+ 
+ 	// render debug-related terrain overlays
+ 	ITerrainOverlay::RenderOverlaysBeforeWater(deviceCommandContext);
+@@ -879,6 +911,9 @@
+ 	m->overlayRenderer.RenderOverlaysBeforeWater(deviceCommandContext);
+ 
+ 	RenderModels(deviceCommandContext, context, cullGroup);
++#if defined(__OHOS__)
++	RST("after-models");
++#endif
+ 
+ 	// render water
+ 	if (m->waterManager.m_RenderWater && g_Game && waterScissor.GetVolume() > 0)
+@@ -927,6 +962,9 @@
+ 		m->shadow.RenderDebugBounds();
+ 
+ 	m->silhouetteRenderer.RenderDebugBounds(deviceCommandContext);
++#if defined(__OHOS__)
++	RST("done");
++#endif
+ }
+ 
+ void CSceneRenderer::EndFrame()
+diff -ruN --text a/source/renderer/WaterManager.cpp b/source/renderer/WaterManager.cpp
+--- a/source/renderer/WaterManager.cpp	2025-12-22 11:24:51
++++ b/source/renderer/WaterManager.cpp	2026-09-27 11:22:45
+@@ -931,6 +931,12 @@
+ 
+ 	Renderer::Backend::IFramebuffer* framebuffer =
+ 		m_FancyEffectsFramebuffer.get();
++	if (!framebuffer)
++	{
++		// The offscreen target failed to create (unsupported depth/format on
++		// this driver). Skip waves instead of dereferencing a null framebuffer.
++		return;
++	}
+ 	deviceCommandContext->BeginFramebufferPass(framebuffer);
+ 	Renderer::Backend::IDeviceCommandContext::Rect viewportRect{};
+ 	viewportRect.width = framebuffer->GetWidth();
+diff -ruN --text a/source/renderer/backend/IDevice.h b/source/renderer/backend/IDevice.h
+--- a/source/renderer/backend/IDevice.h	2025-12-22 11:24:51
++++ b/source/renderer/backend/IDevice.h	2026-09-26 15:49:20
+@@ -30,8 +30,8 @@
+ #include <string>
+ #include <vector>
+ 
++#include "ps/CStr.h"
+ class CShaderDefines;
+-class CStr;
+ class ScriptRequest;
+ namespace Renderer::Backend { class IComputePipelineState; }
+ namespace Renderer::Backend { class IDeviceCommandContext; }
+diff -ruN --text a/source/renderer/backend/gl/Device.cpp b/source/renderer/backend/gl/Device.cpp
+--- a/source/renderer/backend/gl/Device.cpp	2025-12-22 11:24:51
++++ b/source/renderer/backend/gl/Device.cpp	2026-09-26 22:54:25
+@@ -41,7 +41,6 @@
+ #include "renderer/backend/gl/Texture.h"
+ #include "scriptinterface/Object.h"
+ 
+-#include <SDL_config.h>
+ #include <SDL_error.h>
+ #include <SDL_version.h>
+ #include <SDL_video.h>
+@@ -62,6 +61,13 @@
+ extern void* wutil_GetAppHDC();
+ #endif
+ 
++// SDL3's SDL_GL_GetProcAddress returns a function pointer (SDL_FunctionPointer),
++// while ogl_Init expects a function returning void*. Wrap it.
++static void* GetGLProcAddressAsVoidPtr(const char* name)
++{
++	return reinterpret_cast<void*>(SDL_GL_GetProcAddress(name));
++}
++
+ #if !CONFIG2_GLES && (defined(SDL_VIDEO_DRIVER_X11) || defined(SDL_VIDEO_DRIVER_WAYLAND))
+ 
+ #if defined(SDL_VIDEO_DRIVER_X11)
+@@ -224,6 +230,17 @@
+ 
+ } // anonymous namespace
+ 
++#if OS_HARMONYOS
++static void OH_RepTrace(const char* tag)
++{
++	FILE* f = fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt", "a");
++	if (f) { fprintf(f, "%s\n", tag); fclose(f); }
++}
++#define REPTRACE(t) OH_RepTrace(t)
++#else
++#define REPTRACE(t) do {} while(0)
++#endif
++
+ // static
+ std::unique_ptr<IDevice> CDevice::Create(SDL_Window* window, const bool arb)
+ {
+@@ -235,13 +252,22 @@
+ 		// call SDL_GL_LoadLibrary if we have a window with SDL_WINDOW_OPENGL,
+ 		// because it'll be called internally for the first created window.
+ 		device->m_Window = window;
++#if OS_HARMONYOS
++		// Request an OpenGL ES 3.0 context. With SDL's default attributes the
++		// context is GLES2, and the desktop glad loader then only resolves GL1/2
++		// functions, leaving the GL3 framebuffer entry points null (crash on the
++		// first FBO bind).
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++#endif
+ 		device->m_Context = SDL_GL_CreateContext(device->m_Window);
+ 		if (!device->m_Context)
+ 		{
+ 			LOGERROR("SDL_GL_CreateContext failed: '%s'", SDL_GetError());
+ 			return nullptr;
+ 		}
+-		SDL_GL_GetDrawableSize(window, &device->m_SurfaceDrawableWidth, &device->m_SurfaceDrawableHeight);
++		SDL_GetWindowSizeInPixels(window, &device->m_SurfaceDrawableWidth, &device->m_SurfaceDrawableHeight);
+ 
+ #if OS_WIN
+ 		ogl_Init(SDL_GL_GetProcAddress, wutil_GetAppHDC());
+@@ -278,8 +304,19 @@
+ 			break;
+ 		}
+ #else
+-		ogl_Init(SDL_GL_GetProcAddress);
++		ogl_Init(GetGLProcAddressAsVoidPtr);
+ #endif
++#if OS_HARMONYOS
++		{
++			const char* v = reinterpret_cast<const char*>(glGetString(GL_VERSION));
++			char vb[200];
++			snprintf(vb, sizeof(vb), "gl version='%s' bindfb=%p genfb=%p",
++				v ? v : "(null)",
++				(void*)(void(*)())glBindFramebuffer,
++				(void*)(void(*)())glGenFramebuffers);
++			OH_RepTrace(vb);
++		}
++#endif
+ 	}
+ 	else
+ 	{
+@@ -311,7 +348,7 @@
+ 			return nullptr;
+ 		}
+ #else
+-		ogl_Init(SDL_GL_GetProcAddress);
++		ogl_Init(GetGLProcAddressAsVoidPtr);
+ #endif
+ 
+ #if OS_WIN || defined(SDL_VIDEO_DRIVER_X11) && !CONFIG2_GLES
+@@ -499,7 +536,7 @@
+ #endif
+ 
+ 	if (m_Context)
+-		SDL_GL_DeleteContext(m_Context);
++		SDL_GL_DestroyContext(m_Context);
+ }
+ 
+ void CDevice::Report(const ScriptRequest& rq, JS::HandleValue settings)
+@@ -557,6 +594,12 @@
+ 	Script::SetProperty(rq, settings, "GL_" #id, std::string(c)); \
+ 	}  while (false)
+ 
++#if OS_HARMONYOS
++// The HarmonyOS GL compatibility layer advertises ARB query extensions yet
++// crashes inside glGetQueryivARB, so report these as unavailable instead.
++#define QUERY(target, pname) \
++	Script::SetProperty(rq, settings, "GL_" #target ".GL_" #pname, errstr)
++#else
+ #define QUERY(target, pname) do { \
+ 	GLint i = -1; \
+ 	glGetQueryivARB(GL_##target, GL_##pname, &i); \
+@@ -565,6 +608,7 @@
+ 	else \
+ 		Script::SetProperty(rq, settings, "GL_" #target ".GL_" #pname, i); \
+ 	} while (false)
++#endif
+ 
+ #define VERTEXPROGRAM(id) do { \
+ 	GLint i = -1; \
+@@ -595,6 +639,7 @@
+ 	STRING(VENDOR);
+ 	STRING(RENDERER);
+ 	STRING(EXTENSIONS);
++	REPTRACE("rep strings");
+ 
+ #if !CONFIG2_GLES
+ 	INTEGER(MAX_CLIP_PLANES);
+@@ -633,6 +678,7 @@
+ #endif
+ 	INTEGER(DEPTH_BITS);
+ 	INTEGER(STENCIL_BITS);
++	REPTRACE("rep after-basic");
+ 
+ #if !CONFIG2_GLES
+ 
+@@ -643,10 +689,12 @@
+ 		FLOAT(MAX_TEXTURE_LOD_BIAS_EXT);
+ 	}
+ 
++	REPTRACE("q-occ-before");
+ 	if (ogl_HaveExtension("GL_ARB_occlusion_query"))
+ 	{
+ 		QUERY(SAMPLES_PASSED, QUERY_COUNTER_BITS);
+ 	}
++	REPTRACE("q-occ-after");
+ 
+ 	if (ogl_HaveExtension("GL_ARB_shading_language_100"))
+ 	{
+@@ -705,15 +753,19 @@
+ 
+ 	// Other interesting extensions:
+ 
++	REPTRACE("q-time-before");
+ 	if (ogl_HaveExtension("GL_EXT_timer_query") || ogl_HaveExtension("GL_ARB_timer_query"))
+ 	{
+ 		QUERY(TIME_ELAPSED, QUERY_COUNTER_BITS);
+ 	}
++	REPTRACE("q-time-after");
+ 
++	REPTRACE("q-ts-before");
+ 	if (ogl_HaveExtension("GL_ARB_timer_query"))
+ 	{
+ 		QUERY(TIMESTAMP, QUERY_COUNTER_BITS);
+ 	}
++	REPTRACE("q-ts-after");
+ 
+ 	if (ogl_HaveExtension("GL_EXT_texture_filter_anisotropic"))
+ 	{
+@@ -815,6 +867,7 @@
+ 		INTEGER(MAX_SHADER_STORAGE_BLOCK_SIZE);
+ 		INTEGER(MAX_SHADER_STORAGE_BUFFER_BINDINGS);
+ 	}
++	REPTRACE("rep after-desktopext");
+ 
+ #else // CONFIG2_GLES
+ 
+@@ -896,6 +949,7 @@
+ 		}
+ 	}
+ #endif // SDL_VIDEO_DRIVER_X11
++	REPTRACE("rep done");
+ }
+ 
+ std::unique_ptr<IDeviceCommandContext> CDevice::CreateCommandContext()
+diff -ruN --text a/source/renderer/backend/gl/Device.h b/source/renderer/backend/gl/Device.h
+--- a/source/renderer/backend/gl/Device.h	2025-12-22 11:24:51
++++ b/source/renderer/backend/gl/Device.h	2026-09-26 15:44:15
+@@ -40,8 +40,7 @@
+ namespace Renderer::Backend::GL { class CDeviceCommandContext; }
+ namespace Renderer::Backend::GL { class CFramebuffer; }
+ 
+-typedef struct SDL_Window SDL_Window;
+-typedef void* SDL_GLContext;
++#include <SDL_video.h>
+ 
+ namespace Renderer
+ {
+diff -ruN --text a/source/renderer/backend/gl/DeviceCommandContext.cpp b/source/renderer/backend/gl/DeviceCommandContext.cpp
+--- a/source/renderer/backend/gl/DeviceCommandContext.cpp	2025-12-22 11:24:51
++++ b/source/renderer/backend/gl/DeviceCommandContext.cpp	2026-09-26 22:49:26
+@@ -224,15 +224,28 @@
+ } // anonymous namespace
+ 
+ // static
++#if OS_HARMONYOS
++static void OH_DCCTrace(const char* tag)
++{
++	FILE* f = fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt", "a");
++	if (f) { fprintf(f, "%s\n", tag); fclose(f); }
++}
++#endif
++
+ std::unique_ptr<CDeviceCommandContext> CDeviceCommandContext::Create(CDevice* device)
+ {
++	OH_DCCTrace("cc before-ctor");
+ 	std::unique_ptr<CDeviceCommandContext> deviceCommandContext(new CDeviceCommandContext(device));
++	OH_DCCTrace("cc after-ctor");
++	OH_DCCTrace("cc before-backbuffer");
+ 	deviceCommandContext->m_Framebuffer = device->GetCurrentBackbuffer(
+ 		Renderer::Backend::AttachmentLoadOp::DONT_CARE,
+ 		Renderer::Backend::AttachmentStoreOp::DONT_CARE,
+ 		Renderer::Backend::AttachmentLoadOp::DONT_CARE,
+ 		Renderer::Backend::AttachmentStoreOp::DONT_CARE)->As<CFramebuffer>();
++	OH_DCCTrace("cc after-backbuffer");
+ 	deviceCommandContext->ResetStates();
++	OH_DCCTrace("cc after-reset");
+ 	return deviceCommandContext;
+ }
+ 
+@@ -604,15 +617,31 @@
+ 
+ void CDeviceCommandContext::ResetStates()
+ {
++	OH_DCCTrace("rs before-pso");
+ 	SetGraphicsPipelineStateImpl(MakeDefaultGraphicsPipelineStateDesc(), true);
++	OH_DCCTrace("rs after-pso");
+ 	SetScissors(0, nullptr);
++	OH_DCCTrace("rs after-scissors");
+ 	m_Framebuffer = m_Device->GetCurrentBackbuffer(
+ 		Renderer::Backend::AttachmentLoadOp::DONT_CARE,
+ 		Renderer::Backend::AttachmentStoreOp::DONT_CARE,
+ 		Renderer::Backend::AttachmentLoadOp::DONT_CARE,
+ 		Renderer::Backend::AttachmentStoreOp::DONT_CARE)->As<CFramebuffer>();
+-	glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, m_Framebuffer->GetHandle());
++	OH_DCCTrace("rs before-bindfb");
++	{
++		GLuint fbhandle = m_Framebuffer ? m_Framebuffer->GetHandle() : 9999;
++		char rsb[160];
++		snprintf(rsb, sizeof(rsb),
++			"rs ptrs enable=%p bindfb=%p genfb=%p viewport=%p active=%p",
++			(void*)(void(*)())glEnable, (void*)(void(*)())glBindFramebuffer,
++			(void*)(void(*)())glGenFramebuffers, (void*)(void(*)())glViewport,
++			(void*)(void(*)())glActiveTexture);
++		OH_DCCTrace(rsb);
++		glBindFramebuffer(GL_FRAMEBUFFER, fbhandle);
++	}
++	OH_DCCTrace("rs after-bindfb");
+ 	ogl_WarnIfError();
++	OH_DCCTrace("rs done");
+ }
+ 
+ void CDeviceCommandContext::SetGraphicsPipelineStateImpl(
+@@ -649,6 +678,7 @@
+ 		m_ShaderProgram = nextShaderProgram;
+ 	}
+ 
++	OH_DCCTrace("pso before-depth");
+ 	const SDepthStencilStateDesc& currentDepthStencilStateDesc = m_GraphicsPipelineStateDesc.depthStencilState;
+ 	const SDepthStencilStateDesc& nextDepthStencilStateDesc = pipelineStateDesc.depthStencilState;
+ 	if (force || currentDepthStencilStateDesc.depthTestEnabled != nextDepthStencilStateDesc.depthTestEnabled)
+@@ -735,6 +765,7 @@
+ 		}
+ 	}
+ 
++	OH_DCCTrace("pso before-blend");
+ 	const SBlendStateDesc& currentBlendStateDesc = m_GraphicsPipelineStateDesc.blendState;
+ 	const SBlendStateDesc& nextBlendStateDesc = pipelineStateDesc.blendState;
+ 	if (force || currentBlendStateDesc.enabled != nextBlendStateDesc.enabled)
+@@ -799,20 +830,24 @@
+ 		ApplyColorMask(nextBlendStateDesc.colorWriteMask);
+ 	}
+ 
++	OH_DCCTrace("pso before-raster");
+ 	const SRasterizationStateDesc& currentRasterizationStateDesc =
+ 		m_GraphicsPipelineStateDesc.rasterizationState;
+ 	const SRasterizationStateDesc& nextRasterizationStateDesc =
+ 		pipelineStateDesc.rasterizationState;
++	OH_DCCTrace("rast before-polygonmode");
+ 	if (force ||
+ 		currentRasterizationStateDesc.polygonMode != nextRasterizationStateDesc.polygonMode)
+ 	{
+-#if !CONFIG2_GLES
++#if !CONFIG2_GLES && !OS_HARMONYOS
+ 		glPolygonMode(
+ 			GL_FRONT_AND_BACK,
+ 			nextRasterizationStateDesc.polygonMode == PolygonMode::LINE ? GL_LINE : GL_FILL);
+ #endif
+ 	}
++	OH_DCCTrace("rast after-polygonmode");
+ 
++	OH_DCCTrace("rast before-cull");
+ 	if (force ||
+ 		currentRasterizationStateDesc.cullMode != nextRasterizationStateDesc.cullMode)
+ 	{
+@@ -827,7 +862,9 @@
+ 			glCullFace(nextRasterizationStateDesc.cullMode == CullMode::FRONT ? GL_FRONT : GL_BACK);
+ 		}
+ 	}
++	OH_DCCTrace("rast after-cull");
+ 
++	OH_DCCTrace("rast before-frontface");
+ 	if (force ||
+ 		currentRasterizationStateDesc.frontFace != nextRasterizationStateDesc.frontFace)
+ 	{
+@@ -837,7 +874,7 @@
+ 			glFrontFace(GL_CCW);
+ 	}
+ 
+-#if !CONFIG2_GLES
++#if !CONFIG2_GLES && !OS_HARMONYOS
+ 	if (force ||
+ 		currentRasterizationStateDesc.depthBiasEnabled != nextRasterizationStateDesc.depthBiasEnabled)
+ 	{
+@@ -854,11 +891,18 @@
+ 			nextRasterizationStateDesc.depthBiasSlopeFactor,
+ 			nextRasterizationStateDesc.depthBiasConstantFactor);
+ 	}
++#else
++	// HarmonyOS runs on a GLES-based context: wireframe polygon mode and the
++	// polygon-offset enable are desktop-only; depth bias is applied through the
++	// shader instead.
++	OH_DCCTrace("rast depthbias skipped (GLES)");
+ #endif
+ 
++	OH_DCCTrace("pso before-end");
+ 	ogl_WarnIfError();
+ 
+ 	m_GraphicsPipelineStateDesc = pipelineStateDesc;
++	OH_DCCTrace("pso done");
+ }
+ 
+ void CDeviceCommandContext::BlitFramebuffer(
+diff -ruN --text a/source/renderer/backend/gl/Framebuffer.cpp b/source/renderer/backend/gl/Framebuffer.cpp
+--- a/source/renderer/backend/gl/Framebuffer.cpp	2025-12-22 11:24:51
++++ b/source/renderer/backend/gl/Framebuffer.cpp	2026-09-26 23:37:07
+@@ -37,6 +37,12 @@
+ {
+ 
+ // static
++#if defined(__OHOS__)
++#include <stdio.h>
++static void OH_FBTrace(const char* t)
++{ FILE* f=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a");
++  if(f){fprintf(f,"%s\n",t);fclose(f);} }
++#endif
+ std::unique_ptr<CFramebuffer> CFramebuffer::Create(
+ 	CDevice* device, [[maybe_unused]] const char* name, SColorAttachment* colorAttachment,
+ 	SDepthStencilAttachment* depthStencilAttachment)
+@@ -57,6 +63,9 @@
+ 		framebuffer->m_DepthStencilAttachmentStoreOp = depthStencilAttachment->storeOp;
+ 	}
+ 
++#if defined(__OHOS__)
++	OH_FBTrace("fb before-gen");
++#endif
+ 	glGenFramebuffersEXT(1, &framebuffer->m_Handle);
+ 	if (!framebuffer->m_Handle)
+ 	{
+@@ -64,6 +73,9 @@
+ 		return nullptr;
+ 	}
+ 	glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, framebuffer->m_Handle);
++#if defined(__OHOS__)
++	OH_FBTrace("fb after-bind");
++#endif
+ 
+ 	if (colorAttachment)
+ 	{
+@@ -83,6 +95,9 @@
+ 		glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0,
+ 			textureTarget, colorAttachmentTexture->GetHandle(), 0);
+ 	}
++#if defined(__OHOS__)
++	OH_FBTrace("fb after-color");
++#endif
+ 
+ 	if (depthStencilAttachment)
+ 	{
+@@ -126,7 +141,7 @@
+ 
+ 	ogl_WarnIfError();
+ 
+-#if !CONFIG2_GLES
++#if !CONFIG2_GLES && !OS_HARMONYOS
+ 	if (!colorAttachment)
+ 	{
+ 		glReadBuffer(GL_NONE);
+@@ -145,6 +160,9 @@
+ 	}
+ #endif
+ 
++#if defined(__OHOS__)
++	OH_FBTrace("fb before-status");
++#endif
+ 	const GLenum status = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
+ 	if (status != GL_FRAMEBUFFER_COMPLETE_EXT)
+ 	{
+diff -ruN --text a/source/renderer/backend/gl/ShaderProgram.cpp b/source/renderer/backend/gl/ShaderProgram.cpp
+--- a/source/renderer/backend/gl/ShaderProgram.cpp	2025-12-22 11:24:51
++++ b/source/renderer/backend/gl/ShaderProgram.cpp	2026-09-27 11:57:39
+@@ -162,6 +162,18 @@
+ 	return GL_FALSE;
+ }
+ 
++#if defined(__OHOS__)
++// The loader profile used here exposes the classic glGetString(GL_EXTENSIONS)
++// list. We use it to decide which GLSL ES 1.00 compatibility extensions we
++// may safely enable (an unsupported '#extension : enable' is a hard error).
++bool OH_GLHasExtension(const char* name)
++{
++	const GLubyte* all = glGetString(GL_EXTENSIONS);
++	return all && name &&
++		std::strstr(reinterpret_cast<const char*>(all), name) != nullptr;
++}
++#endif
++
+ int GetAttributeLocationFromStream(
+ 	CDevice* device, const VertexAttributeStream stream)
+ {
+@@ -241,6 +253,61 @@
+ 
+ 	source = preprocessor.Preprocess(file.GetAsString());
+ 
++#if defined(__OHOS__)
++	if (!arb)
++	{
++		// The GL backend ships desktop GLSL (#version 110/120, fixed-function
++		// style). The GLES compiler only accepts GLSL ES; that old syntax maps
++		// directly to GLSL ES 1.00, so normalize the version directive and add
++		// default precision for fragment shaders.
++		std::string src = source.c_str();
++		if (src.compare(0, 8, "#version") == 0)
++		{
++			size_t eol = src.find('\n');
++			src = "#version 100" + (eol == std::string::npos ? "" : src.substr(eol));
++		}
++		else
++			src = "#version 100\n" + src;
++		if (stage && std::string(stage) == "STAGE_FRAGMENT")
++		{
++			size_t eol = src.find('\n');
++			const std::string precision = "precision highp float;\nprecision highp int;\n";
++			// Desktop shaders (e.g. FXAA, #version 130) call textureLod(), which
++			// is not in GLSL ES 1.00. Detect the ES2 texture-LOD extension at
++			// runtime: an unsupported '#extension : enable' is a HARD compile
++			// error on this driver (not merely a warning), which would fail every
++			// fragment shader and black out the scene.
++			std::string extensions;
++			if (OH_GLHasExtension("GL_EXT_shader_texture_lod"))
++			{
++				extensions +=
++					"#extension GL_EXT_shader_texture_lod : enable\n";
++			}
++			// The shadowed variants declare sampler2DShadow and call shadow2D(),
++			// which are only available in GLSL ES 1.00 through GL_EXT_shadow_samplers.
++			const bool haveShadowExt = OH_GLHasExtension("GL_EXT_shadow_samplers");
++			if (haveShadowExt)
++				extensions += "#extension GL_EXT_shadow_samplers : enable\n";
++			std::string lodCompat;
++			if (OH_GLHasExtension("GL_EXT_shader_texture_lod"))
++			{
++				lodCompat =
++					"#define textureLod(s,p,l) texture2DLod(s,p,l)\n";
++			}
++			else
++			{
++				// No explicit-LOD fetch in GLSL ES 1.00; drop the lod argument
++				// (correct for the common lod==0 case).
++				lodCompat = "#define textureLod(s,p,l) texture2D(s,p)\n";
++			}
++			const std::string header = extensions + lodCompat + precision;
++			if (eol == std::string::npos) src += "\n" + header;
++			else src.insert(eol + 1, header);
++		}
++		source = CStr(src.c_str());
++	}
++#endif
++
+ 	return true;
+ }
+ 
+@@ -314,12 +381,21 @@
+ 	{
+ 		std::unique_ptr<char[]> infolog = std::make_unique<char[]>(length);
+ 		glGetShaderInfoLog(shader, length, nullptr, infolog.get());
++#if defined(__OHOS__)
++		{ FILE* _cf=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a");
++		  if(_cf){fprintf(_cf,"shaderc ok=%d file=%s log=%.700s\n",(int)ok,file.string8().c_str(),infolog.get());fclose(_cf);} }
++#endif
+ 
+ 		if (ok)
+ 			LOGMESSAGE("Info when compiling shader '%s':\n%s", file.string8(), infolog.get());
+ 		else
+ 			LOGERROR("Failed to compile shader '%s':\n%s", file.string8(), infolog.get());
+ 	}
++#if defined(__OHOS__)
++	else
++	{ FILE* _cf=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a");
++	  if(_cf){fprintf(_cf,"shaderc ok=%d file=%s (no infolog)\n",(int)ok,file.string8().c_str());fclose(_cf);} }
++#endif
+ 
+ 	ogl_WarnIfError();
+ 
+diff -ruN --text a/source/renderer/backend/gl/Texture.cpp b/source/renderer/backend/gl/Texture.cpp
+--- a/source/renderer/backend/gl/Texture.cpp	2025-12-22 11:24:51
++++ b/source/renderer/backend/gl/Texture.cpp	2026-09-27 11:28:25
+@@ -232,12 +232,29 @@
+ 		case Format::D24_UNORM:
+ 			internalFormat = GL_DEPTH_COMPONENT24;
+ 			pixelFormat = GL_DEPTH_COMPONENT;
++#if defined(__OHOS__)
++			// OpenGL ES (and desktop GL) require the type to match the sized
++			// internal format: DEPTH_COMPONENT24 needs UNSIGNED_INT. The old
++			// UNSIGNED_SHORT is invalid and leaves the texture incomplete,
++			// which made every depth-using offscreen FBO fail to create.
++			pixelType = GL_UNSIGNED_INT;
++#else
+ 			pixelType = GL_UNSIGNED_SHORT;
++#endif
+ 			break;
+ 		case Format::D32_SFLOAT:
++#if defined(__OHOS__)
++			// Use the unsized internal format with FLOAT so the driver picks a
++			// floating-point depth buffer (the sized DEPTH_COMPONENT32F token is
++			// not exposed by the GL loader used in this build).
++			internalFormat = GL_DEPTH_COMPONENT;
++			pixelFormat = GL_DEPTH_COMPONENT;
++			pixelType = GL_FLOAT;
++#else
+ 			internalFormat = GL_DEPTH_COMPONENT32;
+ 			pixelFormat = GL_DEPTH_COMPONENT;
+ 			pixelType = GL_UNSIGNED_SHORT;
++#endif
+ 			break;
+ 		case Format::D24_UNORM_S8_UINT:
+ 			internalFormat = GL_DEPTH24_STENCIL8_EXT;
+diff -ruN --text a/source/renderer/backend/vulkan/Device.cpp b/source/renderer/backend/vulkan/Device.cpp
+--- a/source/renderer/backend/vulkan/Device.cpp	2025-12-22 11:24:51
++++ b/source/renderer/backend/vulkan/Device.cpp	2026-09-26 15:44:15
+@@ -84,10 +84,9 @@
+ 	if (!window)
+ 		return {};
+ 
+-	const size_t MAX_EXTENSION_COUNT = 16;
+-	unsigned int SDLExtensionCount = MAX_EXTENSION_COUNT;
+-	const char* SDLExtensions[MAX_EXTENSION_COUNT];
+-	ENSURE(SDL_Vulkan_GetInstanceExtensions(window, &SDLExtensionCount, SDLExtensions));
++	Uint32 SDLExtensionCount = 0;
++	const char* const* SDLExtensions = SDL_Vulkan_GetInstanceExtensions(&SDLExtensionCount);
++	ENSURE(SDLExtensions);
+ 	std::vector<const char*> requiredExtensions;
+ 	requiredExtensions.reserve(SDLExtensionCount);
+ 	std::copy_n(SDLExtensions, SDLExtensionCount, std::back_inserter(requiredExtensions));
+@@ -337,7 +336,7 @@
+ 	}
+ 
+ 	if (window)
+-		ENSURE(SDL_Vulkan_CreateSurface(window, device->m_Instance, &device->m_Surface));
++		ENSURE(SDL_Vulkan_CreateSurface(window, device->m_Instance, nullptr, &device->m_Surface));
+ 
+ 	const std::vector<const char*> requiredDeviceExtensions =
+ 	{
+@@ -1065,7 +1064,7 @@
+ 	}
+ 
+ 	int surfaceDrawableWidth = 0, surfaceDrawableHeight = 0;
+-	SDL_Vulkan_GetDrawableSize(m_Window, &surfaceDrawableWidth, &surfaceDrawableHeight);
++	SDL_GetWindowSizeInPixels(m_Window, &surfaceDrawableWidth, &surfaceDrawableHeight);
+ 	m_SwapChain = CSwapChain::Create(
+ 		this, m_Surface, surfaceDrawableWidth, surfaceDrawableHeight, std::move(m_SwapChain));
+ }
+diff -ruN --text a/source/soundmanager/SoundManager.cpp b/source/soundmanager/SoundManager.cpp
+--- a/source/soundmanager/SoundManager.cpp	2025-12-22 11:24:54
++++ b/source/soundmanager/SoundManager.cpp	2026-09-27 00:56:23
+@@ -198,7 +198,16 @@
+ 	if (g_SoundManager)
+ 		return;
+ 
++#if defined(__OHOS__)
++	setenv("ALSOFT_DRIVERS","sdl3",1);
++	setenv("ALSOFT_LOGLEVEL","3",1);
++	setenv("ALSOFT_LOGFILE","/data/storage/el2/base/haps/entry/files/0ad/data/openal_log.txt",1);
++	{ FILE* f=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a"); if(f){fprintf(f,"snd before alcOpenDevice\n");fclose(f);} }
++#endif
+ 	ALCdevice* device = alcOpenDevice(nullptr);
++#if defined(__OHOS__)
++	{ FILE* f=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a"); if(f){fprintf(f,"snd alcOpenDevice=%p\n",(void*)device);fclose(f);} }
++#endif
+ 	if (!device)
+ 	{
+ 		LOGWARNING("No audio device was found.");
+@@ -206,6 +215,9 @@
+ 	}
+ 
+ 	g_SoundManager = new CSoundManager(device);
++#if defined(__OHOS__)
++	{ FILE* f=fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt","a"); if(f){fprintf(f,"snd SoundManager created ctx=%p\n",(void*)g_SoundManager);fclose(f);} }
++#endif
+ 	g_SoundManager->StartWorker();
+ }
+ 
+diff -ruN --text a/source/third_party/glad/src/gl.cpp b/source/third_party/glad/src/gl.cpp
+--- a/source/third_party/glad/src/gl.cpp	2025-12-22 11:24:54
++++ b/source/third_party/glad/src/gl.cpp	2026-09-26 23:56:18
+@@ -36,6 +36,14 @@
+ int GLAD_GL_ARB_draw_instanced = 0;
+ int GLAD_GL_ARB_fragment_program = 0;
+ int GLAD_GL_ARB_fragment_shader = 0;
++#if defined(__OHOS__)
++#include <stdio.h>
++static void OH_GLTrace(const char* t)
++{
++    FILE* f = fopen("/data/storage/el2/base/haps/entry/files/0ad/data/fs_trace.txt", "a");
++    if (f) { fprintf(f, "%s\n", t); fclose(f); }
++}
++#endif
+ int GLAD_GL_ARB_framebuffer_object = 0;
+ int GLAD_GL_ARB_framebuffer_sRGB = 0;
+ int GLAD_GL_ARB_geometry_shader4 = 0;
+@@ -1546,7 +1554,13 @@
+     glad_glProgramStringARB = (PFNGLPROGRAMSTRINGARBPROC) load(userptr, "glProgramStringARB");
+ }
+ static void glad_gl_load_GL_ARB_framebuffer_object( GLADuserptrloadfunc load, void* userptr) {
++#if defined(__OHOS__)
++    { char _b[120]; snprintf(_b,sizeof _b,"fbo loader flag=%d",(int)GLAD_GL_ARB_framebuffer_object); OH_GLTrace(_b); }
++#endif
+     if(!GLAD_GL_ARB_framebuffer_object) return;
++#if defined(__OHOS__)
++    OH_GLTrace("fbo loader running");
++#endif
+     glad_glBindFramebuffer = (PFNGLBINDFRAMEBUFFERPROC) load(userptr, "glBindFramebuffer");
+     glad_glBindRenderbuffer = (PFNGLBINDRENDERBUFFERPROC) load(userptr, "glBindRenderbuffer");
+     glad_glBlitFramebuffer = (PFNGLBLITFRAMEBUFFERPROC) load(userptr, "glBlitFramebuffer");
+@@ -2169,6 +2183,37 @@
+     glad_gl_load_GL_VERSION_2_1(load, userptr);
+ 
+     if (!glad_gl_find_extensions_gl()) return 0;
++#if defined(__OHOS__)
++    OH_GLTrace("oh forced-flag block reached");
++    // The context is OpenGL ES 3.2: these features are core there, yet GLES does
++    // not advertise them under the desktop ARB/EXT names the loader checks.
++    // Force the loaders to run (resolving the same-named GLES entry points).
++    GLAD_GL_ARB_compute_shader = 1;
++    GLAD_GL_ARB_draw_buffers = 1;
++    GLAD_GL_ARB_draw_instanced = 1;
++    GLAD_GL_ARB_framebuffer_object = 1;
++    GLAD_GL_ARB_instanced_arrays = 1;
++    GLAD_GL_ARB_map_buffer_range = 1;
++    GLAD_GL_ARB_multitexture = 1;
++    GLAD_GL_ARB_program_interface_query = 1;
++    GLAD_GL_ARB_shader_image_load_store = 1;
++    GLAD_GL_ARB_shader_objects = 1;
++    GLAD_GL_ARB_shader_storage_buffer_object = 1;
++    GLAD_GL_ARB_sync = 1;
++    GLAD_GL_ARB_texture_compression = 1;
++    GLAD_GL_ARB_uniform_buffer_object = 1;
++    GLAD_GL_ARB_vertex_buffer_object = 1;
++    GLAD_GL_ARB_vertex_shader = 1;
++    GLAD_GL_EXT_blend_color = 1;
++    GLAD_GL_EXT_blend_minmax = 1;
++    GLAD_GL_EXT_draw_range_elements = 1;
++    GLAD_GL_EXT_framebuffer_blit = 1;
++    GLAD_GL_EXT_framebuffer_multisample = 1;
++    GLAD_GL_EXT_framebuffer_object = 1;
++    GLAD_GL_EXT_gpu_shader4 = 1;
++    GLAD_GL_EXT_texture_array = 1;
++    GLAD_GL_KHR_debug = 1;
++#endif
+     glad_gl_load_GL_ARB_compute_shader(load, userptr);
+     glad_gl_load_GL_ARB_draw_buffers(load, userptr);
+     glad_gl_load_GL_ARB_draw_instanced(load, userptr);
+@@ -2202,7 +2247,14 @@
+     glad_gl_load_GL_EXT_texture_array(load, userptr);
+     glad_gl_load_GL_KHR_debug(load, userptr);
+ 
+-
++#if defined(__OHOS__)
++    // GLES exposes instancing under un-suffixed core names; the ARB-suffixed
++    // names queried above resolve to NULL, so reload the declared ARB pointers
++    // using the core names.
++    glad_glDrawArraysInstancedARB = (PFNGLDRAWARRAYSINSTANCEDARBPROC)load(userptr, "glDrawArraysInstanced");
++    glad_glDrawElementsInstancedARB = (PFNGLDRAWELEMENTSINSTANCEDARBPROC)load(userptr, "glDrawElementsInstanced");
++    glad_glVertexAttribDivisorARB = (PFNGLVERTEXATTRIBDIVISORARBPROC)load(userptr, "glVertexAttribDivisor");
++#endif
+ 
+     return version;
+ }
+diff -ruN --text a/source/tools/atlas/GameInterface/Handlers/MiscHandlers.cpp b/source/tools/atlas/GameInterface/Handlers/MiscHandlers.cpp
+--- a/source/tools/atlas/GameInterface/Handlers/MiscHandlers.cpp	2025-12-22 11:24:55
++++ b/source/tools/atlas/GameInterface/Handlers/MiscHandlers.cpp	2026-09-26 15:59:13
+@@ -111,9 +111,9 @@
+ MESSAGEHANDLER(GuiMouseButtonEvent)
+ {
+ 	SDL_Event_ ev = { { 0 } };
+-	ev.ev.type = msg->pressed ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
++	ev.ev.type = msg->pressed ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+ 	ev.ev.button.button = msg->button;
+-	ev.ev.button.state = msg->pressed ? SDL_PRESSED : SDL_RELEASED;
++	ev.ev.button.down = msg->pressed;
+ 	ev.ev.button.clicks = msg->clicks;
+ 	float x, y;
+ 	msg->pos->GetScreenSpace(x, y);
+@@ -125,7 +125,7 @@
+ MESSAGEHANDLER(GuiMouseMotionEvent)
+ {
+ 	SDL_Event_ ev = { { 0 } };
+-	ev.ev.type = SDL_MOUSEMOTION;
++	ev.ev.type = SDL_EVENT_MOUSE_MOTION;
+ 	float x, y;
+ 	msg->pos->GetScreenSpace(x, y);
+ 	ev.ev.motion.x = static_cast<u16>(Clamp<int>(x, 0, g_xres));
+@@ -136,9 +136,9 @@
+ MESSAGEHANDLER(GuiKeyEvent)
+ {
+ 	SDL_Event_ ev = { { 0 } };
+-	ev.ev.type = msg->pressed ? SDL_KEYDOWN : SDL_KEYUP;
+-	ev.ev.key.keysym.sym = (SDL_Keycode)(int)msg->sdlkey;
+-	ev.ev.key.keysym.scancode = SDL_GetScancodeFromKey((SDL_Keycode)(int)msg->sdlkey);
++	ev.ev.type = msg->pressed ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
++	ev.ev.key.key = (SDL_Keycode)(int)msg->sdlkey;
++	ev.ev.key.scancode = SDL_GetScancodeFromKey((SDL_Keycode)(int)msg->sdlkey, nullptr);
+ 	in_dispatch_event(&ev);
+ }
+ 
+@@ -147,17 +147,17 @@
+ 	// Simulate special 'text input' events in the SDL
+ 	// This isn't quite compatible with WXWidget's handling,
+ 	// so to avoid trouble we only send 'letter-like' ASCII input.
++	static char textBuf[2];
++	textBuf[0] = (char)msg->sdlkey;
++	textBuf[1] = '\0';
++
+ 	SDL_Event_ ev = { { 0 } };
+-	ev.ev.type = SDL_TEXTEDITING;
+-	ev.ev.text.type = SDL_TEXTEDITING;
+-	ev.ev.text.text[0] = (char)msg->sdlkey;
+-	ev.ev.text.text[1] = (char)0;
++	ev.ev.type = SDL_EVENT_TEXT_EDITING;
++	ev.ev.edit.text = textBuf;
+ 	in_dispatch_event(&ev);
+ 
+-	ev.ev.type = SDL_TEXTINPUT;
+-	ev.ev.text.type = SDL_TEXTINPUT;
+-	ev.ev.text.text[0] = (char)msg->sdlkey;
+-	ev.ev.text.text[1] = (char)0;
++	ev.ev.type = SDL_EVENT_TEXT_INPUT;
++	ev.ev.text.text = textBuf;
+ 	in_dispatch_event(&ev);
+ }
+ 
