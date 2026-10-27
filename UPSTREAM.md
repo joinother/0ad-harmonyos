@@ -48,3 +48,14 @@ diff -ruN --text <原始>/source <修改后>/source > 新补丁.patch
 
 本仓库**不保存签名材料**。`build-profile.json5` 中的 `signingConfigs` 在版本库内为空，
 本地签名请由 DevEco Studio 自动生成，**不要提交**。
+
+## 维护脚本
+
+| 脚本 | 用途 |
+|---|---|
+| `patches/apply.sh` | 把补丁应用到指定 `0ad-0.28.0` 目录（先 dry-run 再应用） |
+| `patches/verify.sh` | 校验当前引擎树是否仍等于「原始 + 补丁」，发现漂移即列出文件并以非 0 退出 |
+| `patches/regen.sh` | 有意改动引擎后重新生成补丁，并打印新的文件数、改动规模与基线 sha256 |
+
+工作区根目录通过 `ZEROAD_ROOT` 指定；未设置时自动按脚本位置推断，
+原始源码默认从 `0ad-0.28.0-unix-build.tar.xz` 解压。

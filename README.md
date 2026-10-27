@@ -92,6 +92,55 @@ You also need:
 4. Symlink or copy SDL3 source: `ln -s /path/to/SDL-src entry/src/main/cpp/SDL`
 5. Build via DevEco Studio or `hvigor` CLI
 
+## Engine Patchset
+
+The Pyrogenesis engine is **not vendored** in this repository. Every HarmonyOS
+change to the engine lives in
+[`patches/0001-ohos-engine-0ad-0.28.0.patch`](./patches/0001-ohos-engine-0ad-0.28.0.patch)
+(61 files, +1460 / −532 lines). [`UPSTREAM.md`](./UPSTREAM.md) records the
+upstream anchor: repository, version (0.28 "Boiorix") and the sha256 of the
+baseline tarball.
+
+```bash
+# Apply to a freshly extracted official 0.28 source tree
+cd 0ad-0.28.0
+patch -p1 < ../0ad-harmonyos/patches/0001-ohos-engine-0ad-0.28.0.patch
+
+# or use the helper (does a dry-run first)
+../0ad-harmonyos/patches/apply.sh .
+```
+
+Two maintenance helpers keep the patch and the working tree from silently
+drifting apart. Both locate the workspace via `$ZEROAD_ROOT` and fall back to
+the baseline tarball:
+
+| Script | Purpose |
+|---|---|
+| `patches/verify.sh` | Checks that the current engine tree still equals *pristine + patch*. Run it after any engine edit; exits non-zero and lists the drifting files. |
+| `patches/regen.sh` | Regenerates the patch from pristine + current sources, prints the new file count / line delta and the baseline sha256 (update `UPSTREAM.md` afterwards). |
+
+```bash
+./patches/verify.sh    # ✅ no drift  /  ⚠️ lists drifting files
+./patches/regen.sh     # rewrite the patch after intentional engine changes
+```
+
+## Dependency Build Scripts
+
+Cross-compile recipes for the OHOS dependencies are tracked in
+[`scripts/deps/`](./scripts/deps/) so a fresh machine can rebuild them. They are
+parameterized — the workspace root comes from `$ZEROAD_ROOT` (auto-detected from
+the script location otherwise) and no absolute personal paths are hard-coded.
+
+| Order | Script | Produces |
+|---|---|---|
+| 1 | `scripts/deps/build_manual.sh` | libsodium, enet |
+| 2 | `scripts/deps/build_openal_curl.sh` | openal-soft (SDL3 backend), curl |
+| 3 | `scripts/deps/build_gloox_miniupnpc.sh` | miniupnpc, gloox |
+| 4 | `scripts/deps/build_bundled.sh` | fcollada, nvtt |
+
+See [`scripts/deps/README.md`](./scripts/deps/README.md) for the expected
+workspace layout, build order and required environment.
+
 ## Input Support
 
 The port supports three input methods simultaneously:
