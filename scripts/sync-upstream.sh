@@ -34,7 +34,7 @@ GIT=(git -c protocol.version=0 -c http.version=HTTP/1.1)
 FORCE=0; [ "${1:-}" = "--fetch" ] && FORCE=1
 
 if [ ! -d "$CLONE/.git" ]; then
-  echo "· 首次拉取上游目录树 $REF（blobless，约 1 MB）"
+  echo "· 首次拉取上游目录树 ${REF}（blobless，约 1 MB）"
   ${GIT[@]+"${GIT[@]}"} clone --depth 1 --single-branch --branch "$REF" \
     --filter=blob:none --no-checkout "$UPSTREAM_URL" "$CLONE"
 elif [ "$FORCE" = "1" ]; then

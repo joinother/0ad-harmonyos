@@ -42,7 +42,7 @@
 
 若将来要接入上游，建议：在 `<workspace>/0ad-0.28.0` 初始化 git 并
 `git remote add upstream https://gitea.wildfiregames.com/0ad/0ad`，
-检出 `v0.28.0` 作为基线提交，再定期 `git merge upstream/master`。
+检出 `v0.28.0` 作为基线提交，再定期 `git merge upstream/main`。
 
 ## 基线核对（2026-10-28）
 
@@ -74,6 +74,63 @@
 ./scripts/sync-upstream.sh --fetch   # 重新拉取上游目录树
 REF=a27.1 ./scripts/sync-upstream.sh # 核对其他上游版本
 ```
+
+## 持续同步上游
+
+### 引擎仓库
+
+`<workspace>/0ad-0.28.0` 现在本身就是一个 git 仓库，这是能"同步"的前提：
+
+- 分支 `ohos` = 上游 `v0.28.0` + **1 个提交**（61 文件）
+- `upstream` remote 指向 Gitea，**blobless**（素材 blob 按需获取，`.git` 仅 ~10 MB）
+- 只跟踪 `source/`；`binaries/data`（约 2 GB 素材）由运行时下载，
+  用 `skip-worktree` 排除，保持树与上游一致
+
+### 冲突面实测（2026-10-28）
+
+| 项目 | 数量 |
+|---|---|
+| 上游 `v0.28.0..main` 改动文件 | **898** |
+| 我们的补丁文件 | 61 |
+| **重叠（= rebase 冲突面）** | **58** |
+| 上游未动过的补丁文件 | 3 |
+
+重叠分布：`source/ps` 18、`source/renderer` 13、`source/gui` 8、`source/lib` 6、
+`source/graphics` 5、其它 8。
+
+**结论：跟 `main` 的成本很高（58/61 都会冲突）。推荐跟随发布 tag 升级。**
+
+### 升级流程（跟随发布，推荐）
+
+```bash
+# 0. 先评估影响（只出报告，不改动任何东西）
+./scripts/upgrade-plan.sh v0.29.0
+
+# 1. 备份
+git -C ../0ad-0.28.0 branch "backup-before-upgrade-$(date +%Y%m%d)"
+
+# 2. 拉新 tag 并把那一个提交 rebase 上去
+cd ../0ad-0.28.0
+git -c protocol.version=0 fetch --depth 1 --filter=blob:none \
+  upstream refs/tags/v0.29.0:refs/tags/v0.29.0
+git rebase v0.29.0
+
+# 3. 解决冲突（优先看 source/ps 与 source/renderer），然后构建验证
+
+# 4. 回到本仓库固化结果
+cd ../0ad-harmonyos
+./patches/regen.sh                      # 重新生成补丁
+./patches/verify.sh                     # 本地 == 原始 + 补丁
+REF=v0.29.0 ./scripts/sync-upstream.sh  # 对上游新 tag 复核
+git commit -am "chore(engine): port to 0 A.D. v0.29.0"
+```
+
+升级后别忘了同步更新本文档的「版本 / 上游 tag / 基线提交 / sha256」四行。
+
+### 跟随 main（不推荐）
+
+`git merge upstream/main` 可行，但冲突面 58/61，且上游平均每月都在动。
+除非需要某个尚未发布的修复，否则不建议。
 
 ## 应用补丁
 
