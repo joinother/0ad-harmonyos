@@ -16,3 +16,8 @@
 
 # SDL3 source (symlink to external SDL-src; create your own — see README)
 /entry/src/main/cpp/SDL
+# 签名材料 — 永不提交
+*.p12
+*.p7b
+*.cer
+/entry/build
